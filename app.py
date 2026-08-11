@@ -25,6 +25,7 @@ import lnp_pdf
 import lnp_entry as LE
 import lnp_predictor_v3_patched as v3
 import lnp_anchor                  # 예전에 저장한 앵커 (파일 이름이 lnp_anchor_2.py라면 lnp_anchor_2 as lnp_anchor 로 적어주세요)
+import lnp_app_patch as P  # 👈 [추가!] 패치 모듈 불러오기
 
 try:
     import lnp_pdf as LP
@@ -325,10 +326,9 @@ with tab_data:
             else:
                 d_clean[col] = np.nan
         
-        # 2. EE 값 자동 정제 (문자열 -> 숫자)
+      # 2. EE 값 자동 정제 (문자열 -> 숫자) - 💡 패치 1 적용 (손실 방지)
         ee_col = "encapsulation_efficiency_percent_std_num"
-        d_clean[ee_col] = d_clean[ee_col].astype(str).str.replace(r'[^0-9.]', '', regex=True)
-        d_clean[ee_col] = pd.to_numeric(d_clean[ee_col], errors='coerce')
+        d_clean[ee_col] = d_clean[ee_col].map(P.robust_ee)
         
         # 3. 숫자형 컬럼 타입 변환
         num_cols = ["np_ratio_std_num", "buffer_ph_std_num", "particle_size_nm_std_num", "pdi_std_num", "zeta_potential_mv_std_num"]
@@ -347,15 +347,17 @@ with tab_data:
         c1, c2 = st.columns(2)
         if c1.button(f"정상 데이터 {len(d_clean) - n_invalid}행 추가하기"):
             valid_d = d_clean.dropna(subset=[ee_col])
+            valid_d = P.dedupe(valid_d)  # 💡 패치 2 적용 (중복 제거)
             add_rows(valid_d)
-            st.success("✅ 안전하게 추가되었습니다.")
+            st.success("✅ 중복 제거 후 안전하게 추가되었습니다.")
             st.rerun()
             
         if c2.button("기존 데이터를 이 파일로 교체"):
             valid_d = d_clean.dropna(subset=[ee_col])
+            valid_d = P.dedupe(valid_d)  # 💡 패치 2 적용 (중복 제거)
             st.session_state.df = valid_d
             save_disk()
-            st.success("✅ 파일이 표준 형식으로 교체되었습니다.")
+            st.success("✅ 파일이 중복 제거된 표준 형식으로 교체되었습니다.")
             st.rerun()
 
     # =========================================================
@@ -548,7 +550,8 @@ with st.expander("🌐 인터넷 대량 수집 (PMC 자동 검색)", expanded=Fa
 # ==========================================
 
 # ==========================================================================
-# ⚓ 앵커링 (실측 영점 조절) 기능 탭 (최신 버전)
+# ==========================================================================
+# ⚓ 앵커링 (실측 영점 조절) 기능 탭 (k=3 패치 적용 완료)
 # ==========================================================================
 with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=False):
     st.markdown("AI가 추천하는 조성으로 실험하거나, 원하는 조성을 직접 입력하여 영점을 조절합니다.")
@@ -558,8 +561,8 @@ with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=
     with col1:
         st.info("🧪 1. 실험할 조성 선정")
         
-        # 1-1. AI 추천 버튼 (최종 수정본)
-        if st.button("AI 앵커 추천받기"):
+        # 1-1. AI 추천 버튼 (최종 수정본 - 패치 3 적용)
+        if st.button("AI 앵커 추천받기 (k=3)"):
             try:
                 if 'df' not in locals() or df.empty:
                     st.error("먼저 '데이터 관리' 탭에서 학습용 CSV 파일을 업로드해주세요.")
@@ -567,14 +570,15 @@ with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=
                     X, num_cols, cat_cols = v3.build_features(df)
                     m = lnp_anchor.AnchoredEEPredictor(v3, num_cols, cat_cols)
                     m.fit(X, df["encapsulation_efficiency_percent_std_num"])
-                    picks = m.suggest_anchors(X, k=2) 
+                    
+                    # 💡 패치 3 적용: k=2를 k=3으로 변경하여 안정성 극대화
+                    picks = m.suggest_anchors(X, k=3) 
                     
                     st.session_state['anchored_model'] = m
                     st.session_state['anchor_picks'] = picks
                     st.session_state['X_data'] = X
                     
-                    # 💡 성공 메시지 후 즉시 레시피 정보까지 여기서 바로 출력!
-                    st.success(f"🤖 AI가 추천한 앵커: {picks[0]}번, {picks[1]}번")
+                    st.success(f"🤖 AI가 추천한 앵커: {picks[0]}번, {picks[1]}번, {picks[2]}번")
                     
                     st.divider()
                     st.write("📋 **추천된 앵커 상세 정보**")
@@ -587,11 +591,28 @@ with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=
             except Exception as e:
                 st.error(f"오류: {e}")
 
-        # 1-2. 직접 지정하기
+        # 💡 패치 3 적용: 정직한 앵커 홀드아웃 평가 리포트 버튼 추가
+        if st.button("📊 앵커링 정직 평가 리포트 실행"):
+            with st.spinner("논문 단위 홀드아웃 검증 중... (잠시만 기다려주세요)"):
+                try:
+                    R, stats = P.anchor_report(df, v3, lnp_anchor, k=3)
+                    if "note" in stats:
+                        st.warning(stats["note"])
+                    else:
+                        st.success(f"✅ 검증 완료! (총 {stats['papers']}편의 논문으로 테스트)")
+                        st.metric("앵커 3개 적용 시 평균 MAE", 
+                                  f"{stats['mae_anchored']:.1f} %p",
+                                  f"{stats['gain_pct']:+.1f}% (오차 감소)")
+                        st.caption(f"개선 성공 확률: {stats['papers']}편 중 {stats['improved']}편 개선 (p-value: {stats['p_value']:.4f})")
+                except Exception as e:
+                    st.error(f"평가 중 오류: {e}")
+
+        # 1-2. 직접 지정하기 (입력칸 3개로 확장)
         st.write("---")
         st.caption("또는, 데이터 관리 표에서 확인한 '행 번호'를 직접 입력하세요.")
-        manual_1 = st.number_input("실험 1의 데이터 행 번호", min_value=0, max_value=n_rows-1, value=0)
-        manual_2 = st.number_input("실험 2의 데이터 행 번호", min_value=0, max_value=n_rows-1, value=1)
+        manual_1 = st.number_input("실험 1의 데이터 행 번호", min_value=0, max_value=n_rows-1 if n_rows>0 else 0, value=0)
+        manual_2 = st.number_input("실험 2의 데이터 행 번호", min_value=0, max_value=n_rows-1 if n_rows>0 else 0, value=1 if n_rows>1 else 0)
+        manual_3 = st.number_input("실험 3의 데이터 행 번호", min_value=0, max_value=n_rows-1 if n_rows>0 else 0, value=2 if n_rows>2 else 0)
         
         if st.button("직접 지정한 데이터로 앵커 설정"):
             if 'df' in locals() and not df.empty:
@@ -600,11 +621,11 @@ with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=
                 m.fit(X, df["encapsulation_efficiency_percent_std_num"])
                 
                 st.session_state['anchored_model'] = m
-                st.session_state['anchor_picks'] = [manual_1, manual_2]
+                st.session_state['anchor_picks'] = [manual_1, manual_2, manual_3]
                 st.session_state['X_data'] = X
-                st.success(f"✅ 앵커 설정됨: {manual_1}번, {manual_2}번")
+                st.success(f"✅ 앵커 설정됨: {manual_1}번, {manual_2}번, {manual_3}번")
 
-        # 1-3. 앵커 정보 출력
+        # 1-3. 앵커 정보 출력 (자동 대응)
         if 'anchor_picks' in st.session_state:
             st.divider()
             st.write("📋 **현재 설정된 앵커 정보**")
@@ -617,25 +638,27 @@ with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=
 
     with col2:
         st.info("📊 2. 실측 결과 입력 및 예측")
+        # 실측값 입력칸 3개로 확장
         anchor_1_ee = st.number_input("실험 1의 실제 측정 EE (%)", min_value=0.0, max_value=100.0, value=0.0)
         anchor_2_ee = st.number_input("실험 2의 실제 측정 EE (%)", min_value=0.0, max_value=100.0, value=0.0)
+        anchor_3_ee = st.number_input("실험 3의 실제 측정 EE (%)", min_value=0.0, max_value=100.0, value=0.0)
         
         if st.button("영점 조절 후 전체 예측 실행"):
-            if 'anchored_model' in st.session_state and anchor_1_ee > 0 and anchor_2_ee > 0:
+            if 'anchored_model' in st.session_state and anchor_1_ee > 0 and anchor_2_ee > 0 and anchor_3_ee > 0:
                 m = st.session_state['anchored_model']
                 picks = st.session_state['anchor_picks']
                 X = st.session_state['X_data']
                 
                 with st.spinner("정밀 예측 중..."):
-                    final_preds = m.predict(X, anchor_idx=picks, anchor_y=[anchor_1_ee, anchor_2_ee])
-                    st.success("🎯 보정된 정밀 예측값이 산출되었습니다.")
+                    # 앵커 3개 값 전달
+                    final_preds = m.predict(X, anchor_idx=picks, anchor_y=[anchor_1_ee, anchor_2_ee, anchor_3_ee])
+                    st.success("🎯 3개의 실측값을 바탕으로 보정된 정밀 예측값이 산출되었습니다.")
                     
                     result_df = df.copy()
                     result_df['보정된_예측_EE'] = final_preds
                     st.dataframe(result_df[['reference_doi', 'lipid_molar_ratio', 'encapsulation_efficiency_percent_std_num', '보정된_예측_EE']])
                     
                     csv_data = result_df.to_csv(index=False, encoding='utf-8-sig')
-                    st.download_button("📥 결과 CSV 다운로드", csv_data, "lnp_anchored_predictions.csv", "text/csv", use_container_width=True)
+                    st.download_button("📥 결과 CSV 다운로드", csv_data, "lnp_anchored_predictions_k3.csv", "text/csv", use_container_width=True)
             else:
-                st.warning("먼저 앵커를 추천받거나 지정하고, 두 실측값을 입력하세요.")
-# ==========================================
+                st.warning("먼저 앵커를 추천받거나 지정하고, 3개의 실측값을 모두 0보다 크게 입력하세요.")
