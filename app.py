@@ -10,6 +10,8 @@
 #    2. 직접 입력    — 폼으로 한 줄씩 입력 (SMILES 자동 조회)
 #    3. 데이터 관리  — 전체 표 편집, 검증, CSV 업로드/다운로드
 #    4. 모델 실행    — 논문 단위 CV + 진단 + 순위 평가
+#    5. 최적화       — 앵커 영점 기반 최적 레시피 탐색
+#    6. What-If      — 특정 성분 비율 변경에 따른 효과 시뮬레이션
 # ==========================================================================
 
 import io
@@ -24,8 +26,13 @@ import lnp_harvest
 import lnp_pdf
 import lnp_entry as LE
 import lnp_predictor_v3_patched as v3
-import lnp_anchor                  # 예전에 저장한 앵커 (파일 이름이 lnp_anchor_2.py라면 lnp_anchor_2 as lnp_anchor 로 적어주세요)
-import lnp_app_patch as P  # 👈 [추가!] 패치 모듈 불러오기
+import lnp_anchor                  # 예전에 저장한 앵커 
+import lnp_app_patch as P  # 패치 모듈 불러오기
+import lnp_optimize as O
+from app_tabs_optimize import tab_optimize, tab_whatif
+import lnp_peg as PG
+from app_tab_peg import tab_peg
+
 
 try:
     import lnp_pdf as LP
@@ -95,8 +102,9 @@ if n_rows:
     st.sidebar.download_button("전체 CSV 내려받기", buf.getvalue().encode("utf-8-sig"),
                                "lnp_data.csv", "text/csv", use_container_width=True)
 
-tab_pdf, tab_form, tab_data, tab_model = st.tabs(
-    ["📄 PDF 업로드", "✍️ 직접 입력", "📊 데이터 관리", "🤖 모델 실행"])
+# 기존 tab_what을 tab_peg_view로 변경하고 이름도 직관적으로 수정합니다.
+tab_pdf, tab_form, tab_data, tab_model, tab_opt, tab_peg_view = st.tabs(
+    ["📄 PDF 업로드", "✍️ 직접 입력", "📊 데이터 관리", "🤖 모델 실행", "🎯 최적화", "📉 PEG 비율 변경"])
 
 
 # ==========================================================================
@@ -299,11 +307,6 @@ with tab_form:
 
 
 # ==========================================================================
-
-# ==========================================================================
-
-# ==========================================================================
-# ==========================================================================
 # 탭 3 — 데이터 관리
 # ==========================================================================
 with tab_data:
@@ -365,11 +368,7 @@ with tab_data:
     # =========================================================
     st.divider()
     st.subheader("📝 엑셀에서 바로 복사/붙여넣기")
-    # (이하 복붙 입력창과 전체 데이터 편집창 코드는 기존 그대로 두셔도 됩니다)
     
-    # ... [중간 복붙 및 전체 데이터 편집 부분] ...
-
-    # 전체 데이터 편집 및 저장 버튼 있는 구간부터 다시 붙여넣으세요
     if len(df) == 0:
         st.info("아직 데이터가 없습니다.")
     else:
@@ -403,6 +402,7 @@ with tab_data:
             with contextlib.redirect_stdout(buf):
                 LE.validate(ed)
             st.code(buf.getvalue(), language=None)
+
 # ==========================================================================
 # 탭 4 — 모델 실행
 # ==========================================================================
@@ -548,9 +548,6 @@ with st.expander("🌐 인터넷 대량 수집 (PMC 자동 검색)", expanded=Fa
 
 
 # ==========================================
-
-# ==========================================================================
-# ==========================================================================
 # ⚓ 앵커링 (실측 영점 조절) 기능 탭 (k=3 패치 적용 완료)
 # ==========================================================================
 with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=False):
@@ -662,3 +659,61 @@ with st.expander("⚓ 앵커링 (영점 조절) 기반 정밀 예측", expanded=
                     st.download_button("📥 결과 CSV 다운로드", csv_data, "lnp_anchored_predictions_k3.csv", "text/csv", use_container_width=True)
             else:
                 st.warning("먼저 앵커를 추천받거나 지정하고, 3개의 실측값을 모두 0보다 크게 입력하세요.")
+
+
+# ==========================================================================
+# 🎯 최적화 / What-If 용 순수 Base Model 생성 함수
+# ==========================================================================
+def get_base_pipeline(d_input):
+    """불확실성(분산) 계산을 위해 Scikit-Learn 파이프라인 원형을 학습하여 반환합니다."""
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    d = d_input.copy()
+    y = pd.to_numeric(d["encapsulation_efficiency_percent_std_num"], errors="coerce")
+    frac = (y > 0) & (y <= 1)
+    y = y.where(~frac, y * 100)
+    keep = y.notna() & (y > 0) & (y <= 100)
+    d, y = d[keep].reset_index(drop=True), y[keep].reset_index(drop=True)
+
+    X, num_cols, cat_cols = v3.build_features(d, include_measured=False)
+
+    pre = ColumnTransformer([
+        ("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols),
+        ("c", Pipeline([("i", SimpleImputer(strategy="most_frequent")),
+                        ("o", OneHotEncoder(handle_unknown="ignore", min_frequency=2))]), cat_cols)]
+        if cat_cols else
+        [("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols)])
+    
+    model = Pipeline([("pre", pre),
+                      ("m", RandomForestRegressor(
+                          n_estimators=400, min_samples_leaf=3,
+                          max_features=0.5, random_state=42, n_jobs=-1))])
+    model.fit(X, y)
+    return model
+
+# ==========================================================================
+# 탭 5 — 🎯 최적화
+# ==========================================================================
+with tab_opt:
+    if len(df) > 10:
+        with st.spinner("최적화 엔진 준비 및 모델 학습 중..."):
+            base_model = get_base_pipeline(df)
+        tab_optimize(st, df, base_model, v3_module=v3)
+    else:
+        st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
+
+# ==========================================================================
+# ==========================================================================
+# 탭 6 — 📉 PEG 비율 변경 (새로 추가)
+# ==========================================================================
+with tab_peg_view:
+    if len(df) > 10:
+        # P.dedupe()를 거쳐 중복이 완벽히 제거된 실데이터를 꽂아줍니다.
+        clean_df = P.dedupe(df, verbose=False)
+        tab_peg(st, clean_df)
+    else:
+        st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
