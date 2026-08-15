@@ -34,7 +34,7 @@ from app_tabs_optimize import tab_optimize, tab_whatif
 import lnp_peg as PG
 from app_tab_peg import tab_peg
 
-# 💡 [패치] 새로운 픽스 모듈 & 저장소 모듈 불러오기
+# 💡 [패치 1~7 적용] 새로운 픽스 모듈 불러오기 (이름 오타 수정 완료)
 import lnp_app_fix2 as F2
 import lnp_store as ST
 
@@ -50,10 +50,16 @@ st.set_page_config(page_title="LNP Data Studio", page_icon="🧪", layout="wide"
 DATA_FILE = "lnp_web_data.csv"
 
 # --------------------------------------------------------------------------
-# 상태 및 데이터 저장 (Google Sheets 연동 지원)
+# 상태
 # --------------------------------------------------------------------------
 def _empty():
     return pd.DataFrame(columns=LE.COLS)
+
+if "df" not in st.session_state:
+    if os.path.exists(DATA_FILE):
+        st.session_state.df = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
+    else:
+        st.session_state.df = _empty()
 
 # 💡 [패치 G] Secrets에 맞춰 store 객체 자동 생성
 store = ST.get_store(st)
@@ -85,8 +91,8 @@ cached_model = F2.make_cached_base_model(st, v3)
 # --------------------------------------------------------------------------
 st.sidebar.title("🧪 LNP Data Studio")
 
-# 💡 [패치 F, G] 경고문을 사이드바로 이동하고 Store 상태 표시
-ST.show_store_status(st.sidebar, store)
+# 💡 [에러 수정 완료] ST.show_store_status에 st.sidebar 대신 st를 넘겨 충돌 방지
+ST.show_store_status(st, store)
 F2.show_persistence_warning(st.sidebar)
 
 n_rows = len(work_df)
