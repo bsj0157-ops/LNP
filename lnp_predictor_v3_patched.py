@@ -744,4 +744,7 @@ def run_all():
     return res
 
 
+if __name__ == "__main__":
+    results = run_all()
+
 # results = run_all()
