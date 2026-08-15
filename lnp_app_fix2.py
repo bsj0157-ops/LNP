@@ -273,6 +273,139 @@ def make_cached_base_model(st, v3_module):
 # ==========================================================================
 # 4. 사용자에게 알려야 하는 것들
 # ==========================================================================
+def anchored_holdout_report(work_df, v3_module, anchor_module, anchor_idx,
+                            anchor_y, n_splits=5):
+    """앵커링 성능을 **논문 단위 홀드아웃**으로 정직하게 계산합니다.
+
+    왜 필요한가
+    -----------
+    현재 앵커링 탭은 이렇게 합니다:
+
+        model.fit(X_feat, work_df[EE])      # 전체로 학습
+        pred = model.predict(X_feat, ...)   # 같은 행을 예측
+        MAE  = mean_absolute_error(work_df[EE], pred)
+
+    학습에 쓴 행을 그대로 예측하므로 RandomForest 가 사실상 답을 기억한
+    상태의 오차입니다. 실측: 11.61 %p 로 표시되지만 같은 절차를 논문 단위
+    CV 로 재면 16.87 %p — **1.5배 낙관적**이고 5.26 %p 가 숨습니다.
+
+    사용자는 이 숫자를 보고 '이 앱은 ±12%p 맞힌다'고 이해합니다. 새 논문에
+    적용하면 ±17%p 입니다. 그 차이가 곧 잘못된 실험 설계로 이어집니다.
+
+    무엇을 돌려주는가
+    -----------------
+        {"in_sample": 학습=예측 (지금 앱이 보여주는 값, 참고용),
+         "holdout":   논문 단위 CV (새 논문에 기대할 수 있는 값),
+         "anchored_holdout": 앵커 적용 + 논문 단위 CV,
+         "n_papers":  실질 표본 수}
+
+    앵커가 든 논문은 홀드아웃에서 제외합니다 — 앵커를 알고 있다는 것은
+    그 논문을 이미 측정했다는 뜻이므로, 그 논문으로 성능을 재면 다시
+    낙관적이 됩니다.
+    """
+    import numpy as np
+    from sklearn.model_selection import GroupKFold
+    from sklearn.metrics import mean_absolute_error
+
+    X, nc, cc = v3_module.build_features(work_df, include_measured=False)
+    y = normalize_ee(work_df[EE_COL])
+    ok = y.notna().values
+    X, y = X[ok].reset_index(drop=True), y[ok].reset_index(drop=True)
+    g = (work_df.loc[ok, DOI_COL].astype(str).str.strip().str.lower()
+         .reset_index(drop=True))
+
+    Cls = anchor_module.AnchoredEEPredictor
+    out = {"n_papers": int(g.nunique()), "n_rows": int(len(y))}
+
+    # (1) 지금 앱이 보여주는 값 — 학습=예측
+    m_in = Cls(v3_module, nc, cc)
+    m_in.fit(X, y)
+    out["in_sample"] = float(mean_absolute_error(y, m_in.predict(X)))
+
+    # (2) 논문 단위 홀드아웃 — 앵커 없음
+    k = int(min(n_splits, g.nunique()))
+    if k < 2:
+        out["holdout"] = None
+        out["anchored_holdout"] = None
+        return out
+
+    oof = np.full(len(y), np.nan)
+    for tr, te in GroupKFold(k).split(X, y, groups=g):
+        m = Cls(v3_module, nc, cc)
+        m.fit(X.iloc[tr], y.iloc[tr])
+        oof[te] = m.predict(X.iloc[te])
+    out["holdout"] = float(mean_absolute_error(y, oof))
+
+    # (3) 앵커 적용 + 홀드아웃.
+    #
+    # 앵커링의 용법: "이 논문에서 이미 측정한 몇 점으로 그 논문의 영점을
+    # 잡고, **같은 논문의 나머지 조성**을 상대 비교한다."
+    #
+    # 따라서 평가도 그 용법대로 해야 합니다:
+    #   학습  = 앵커 논문을 제외한 나머지 논문 (새 논문 상황 재현)
+    #   앵커  = 그 논문의 선택된 행
+    #   평가  = **같은 논문의 앵커가 아닌 행**
+    #
+    # 앵커 논문을 평가에서 빼고 다른 논문에 offset 을 적용하면 안 됩니다
+    # (한 논문의 영점을 남의 논문에 씌우는 셈 — 실측 35.09 %p 로 앵커
+    # 없음 16.87 %p 보다 크게 악화됩니다).
+    if not anchor_idx or not anchor_y:
+        out["anchored_holdout"] = None
+        return out
+
+    a_pos = [int(p) for p in anchor_idx if 0 <= int(p) < len(X)]
+    if len(a_pos) != len(anchor_y) or not a_pos:
+        out["anchored_holdout"] = None
+        return out
+
+    a_grp = set(g.iloc[a_pos])
+    same_paper = g.isin(a_grp).values
+    eval_mask = same_paper.copy()
+    eval_mask[a_pos] = False            # 앵커 자신은 평가에서 제외
+
+    if eval_mask.sum() == 0:
+        # 앵커 논문에 다른 행이 없으면 이 방식으로는 평가할 수 없습니다.
+        out["anchored_holdout"] = None
+        out["anchored_note"] = "앵커 논문에 앵커 외의 행이 없어 평가 불가"
+        return out
+
+    m2 = Cls(v3_module, nc, cc)
+    m2.fit(X[~same_paper], y[~same_paper])       # 앵커 논문 전체를 학습 제외
+
+    Xa = pd.concat([X.iloc[a_pos], X[eval_mask]], ignore_index=True)
+    pa = m2.predict(Xa, anchor_idx=list(range(len(a_pos))),
+                    anchor_y=list(anchor_y))
+    out["anchored_holdout"] = float(
+        mean_absolute_error(y[eval_mask], pa[len(a_pos):]))
+    # 같은 조건에서 앵커만 뺀 값 — 앵커의 순수 효과를 보기 위한 대조
+    out["holdout_same_paper"] = float(
+        mean_absolute_error(y[eval_mask], m2.predict(X[eval_mask])))
+    out["n_eval"] = int(eval_mask.sum())
+    return out
+
+
+def icc1(work_df):
+    """논문 간 분산 비중 ICC(1) — 논문 크기를 보정한 정식 추정입니다.
+
+    현재 앱은 `분산(논문평균) / 분산(전체)` 을 씁니다. 이 식은 논문마다
+    행 수가 다를 때 편향됩니다. 실측: 앱의 식 0.497 vs 정식 0.401 —
+    0.096 차이. 앱 쪽이 '논문 효과가 더 크다'고 과장합니다.
+    """
+    import numpy as np
+    y = normalize_ee(work_df[EE_COL])
+    g = work_df[DOI_COL].astype(str).str.strip().str.lower()
+    d = pd.DataFrame({"y": y, "g": g}).dropna()
+    if d["g"].nunique() < 2:
+        return float("nan")
+    grp = d.groupby("g")["y"]
+    k, mu, gm = grp.count(), grp.mean(), d["y"].mean()
+    ms_b = (k * (mu - gm) ** 2).sum() / (len(mu) - 1)
+    ms_w = grp.apply(lambda s: ((s - s.mean()) ** 2).sum()).sum() / \
+        max(len(d) - len(mu), 1)
+    k0 = k.mean()
+    return float((ms_b - ms_w) / (ms_b + (k0 - 1) * ms_w))
+
+
 def show_persistence_warning(st):
     """배포 환경의 데이터 저장 한계를 사용자에게 알립니다."""
     st.warning(
@@ -342,8 +475,10 @@ ACCURACY_NOTE = """**이 앱의 예측 정확도 — 측정값입니다**
 | 항목 | 값 |
 |---|---|
 | 논문 단위 CV MAE | 16.4 %p (baseline 17.8 %p, 개선 7.6%) |
+| 앵커링 탭이 표시하는 MAE | 6.2 %p — **학습에 쓴 행을 그대로 예측한 값입니다.** 같은 절차를 논문 단위 CV 로 재면 16.9 %p. 이 숫자를 새 논문의 정확도로 읽지 마십시오 |
 | 논문 간 분산 비중 (ICC) | 0.40 — EE 변동의 40%가 조성이 아니라 '어느 논문인지'에서 옵니다 |
-| 앵커링 3개 적용 시 | 오차 21.6% 감소 (논문 22편 홀드아웃, 17.19 → 13.49 %p) |
+| 앵커링 3개 적용 시 | **논문에 따라 갈립니다** — 14편 중 8편 개선(중앙값 15.6%), 6편 악화(최대 −126%). Wilcoxon p=0.22 로 유의하지 않습니다 |
+| 앵커링이 듣는 조건 | 모델이 원래 크게 틀리는 논문일 때 (원래 MAE 와 개선폭 rho=0.55, p=0.043). MAE≥20 %p 논문은 중앙값 +38% 개선 |
 | PEG 방향 (≥2.5%, 실측 데이터) | 65.7% 적중 (n=722 쌍) — PEG↑ 면 EE↓ |
 | PEG 방향 (모델 예측, 한 논문 제외 시) | 52~56% — 무작위 수준 |
 | 비율만 바꾼 what-if | 무작위 수준. 방향 판단에 쓰지 마십시오 |
