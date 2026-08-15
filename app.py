@@ -34,8 +34,9 @@ from app_tabs_optimize import tab_optimize, tab_whatif
 import lnp_peg as PG
 from app_tab_peg import tab_peg
 
-# 💡 [패치 1~7 적용] 새로운 픽스 모듈 불러오기 (이름 오타 수정 완료)
+# 💡 [패치] 새로운 픽스 모듈 & 저장소 모듈 불러오기
 import lnp_app_fix2 as F2
+import lnp_store as ST
 
 try:
     import lnp_pdf as LP
@@ -49,25 +50,28 @@ st.set_page_config(page_title="LNP Data Studio", page_icon="🧪", layout="wide"
 DATA_FILE = "lnp_web_data.csv"
 
 # --------------------------------------------------------------------------
-# 상태
+# 상태 및 데이터 저장 (Google Sheets 연동 지원)
 # --------------------------------------------------------------------------
 def _empty():
     return pd.DataFrame(columns=LE.COLS)
 
+# 💡 [패치 G] Secrets에 맞춰 store 객체 자동 생성
+store = ST.get_store(st)
+
 if "df" not in st.session_state:
-    if os.path.exists(DATA_FILE):
-        st.session_state.df = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
-    else:
-        st.session_state.df = _empty()
+    loaded = store.load()
+    st.session_state.df = loaded if loaded is not None else _empty()
 
 def save_disk():
-    st.session_state.df.to_csv(DATA_FILE, index=False, encoding="utf-8-sig")
+    # 💡 [패치 G] 기존 로컬 파일 저장 대신 외부 store에 저장
+    store.save(st.session_state.df)
 
 def add_rows(new: pd.DataFrame):
     cur = st.session_state.df
-    st.session_state.df = pd.concat([cur, new], ignore_index=True)[
-        [c for c in LE.COLS if c in set(LE.COLS)]
-        + [c for c in new.columns if c not in LE.COLS]]
+    out = pd.concat([cur, new], ignore_index=True)
+    # 💡 [패치 D] Key Error를 막는 안전한 컬럼 재정렬
+    head = [c for c in LE.COLS if c in out.columns]
+    st.session_state.df = out[head + [c for c in out.columns if c not in head]]
     save_disk()
 
 # 💡 [패치 1] 모든 탭이 같은 데이터를 쓰도록 work_df 생성
@@ -81,8 +85,9 @@ cached_model = F2.make_cached_base_model(st, v3)
 # --------------------------------------------------------------------------
 st.sidebar.title("🧪 LNP Data Studio")
 
-# 💡 [패치 5] 데이터 증발 및 덮어쓰기 경고 메시지 표시
-F2.show_persistence_warning(st)
+# 💡 [패치 F, G] 경고문을 사이드바로 이동하고 Store 상태 표시
+ST.show_store_status(st.sidebar, store)
+F2.show_persistence_warning(st.sidebar)
 
 n_rows = len(work_df)
 n_pap = (work_df["reference_doi"].astype(str).str.strip().str.lower().nunique()
@@ -318,7 +323,6 @@ with tab_model:
         from sklearn.preprocessing import OneHotEncoder, StandardScaler
         from scipy.stats import spearmanr
 
-        # 💡 [패치 3] 열등한 9개 피처 모델 대신 25개 피처 통합 모델 적용
         X, y, groups, num_cols, cat_cols = F2.build_eval_matrix(work_df, v3)
 
         pre = ColumnTransformer([
@@ -345,8 +349,8 @@ with tab_model:
         c2.metric("baseline MAE", f"{mae_b:.2f} %p")
         c3.metric("개선율", f"{gain:+.1f} %", delta=f"{'유의미' if gain > 5 else '미미'}")
 
-        gm = y.groupby(groups).transform("mean")
-        icc = np.var(gm, ddof=0) / np.var(y, ddof=0) if np.var(y) > 0 else np.nan
+        # 💡 [패치 C] 정식 ICC(1) 계산식 적용
+        icc = F2.icc1(work_df)
         st.write(f"**논문 간 분산 비중(ICC) = {icc:.2f}**")
 
         rhos = [spearmanr(y.loc[idx], pd.Series(pm, index=y.index).loc[idx])[0] 
@@ -366,35 +370,48 @@ with tab_model:
     st.subheader("⚓ 앵커링 (영점 조절) 기반 정밀 예측")
     st.markdown("AI가 추천하는 조성으로 실험하거나, 원하는 조성을 직접 지정하여 영점을 조절합니다.")
     
-    # 💡 [패치 2] 에러를 유발하던 행 번호 입력을 스마트 선택기(anchor_selector)로 완벽 교체
     anchor_idx, anchor_y = F2.anchor_selector(st, work_df, n=3)
 
     if st.button("영점 조절 후 전체 예측 실행 (다운로드)", type="primary"):
-        if anchor_idx and len(anchor_idx) == 3 and anchor_y:
-            with st.spinner("정밀 앵커링 예측 중..."):
+        # 💡 [패치 E] 정확히 3개가 아니어도 1~2개 앵커 허용
+        if anchor_idx and anchor_y and len(anchor_idx) == len(anchor_y):
+            with st.spinner("정직한 앵커링 검증 및 정밀 예측 중..."):
+                
+                # 💡 [패치 A, B] 인샘플 오차가 아닌, 진짜 홀드아웃 리포트 출력
+                rep = F2.anchored_holdout_report(work_df, v3, lnp_anchor, anchor_idx, anchor_y)
+                
+                st.divider()
+                st.write("### 📊 앵커링 실전 검증 리포트")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("논문 단위 CV MAE", f"{rep['holdout']:.1f} %p", help="새 논문에 기대할 수 있는 일반적인 오차입니다")
+                
+                if rep.get("anchored_holdout") is not None:
+                    c2.metric("앵커 적용 (같은 논문)", f"{rep['anchored_holdout']:.1f} %p")
+                    c3.metric("앵커 없음 (같은 논문)", f"{rep['holdout_same_paper']:.1f} %p")
+                
+                st.caption(f"⚠️ 참고: 기존 방식(학습=예측) 기준 오차는 {rep['in_sample']:.1f} %p 였습니다. 이는 모델이 답을 외운 낙관적 수치이므로 실제 정확도로 오인하지 마십시오.")
+
                 X_feat, n_cols, c_cols = v3.build_features(work_df, include_measured=False)
                 m_anchor = lnp_anchor.AnchoredEEPredictor(v3, n_cols, c_cols)
                 m_anchor.fit(X_feat, work_df["encapsulation_efficiency_percent_std_num"])
                 
                 final_preds = m_anchor.predict(X_feat, anchor_idx=anchor_idx, anchor_y=anchor_y)
-                st.success("🎯 3개의 실측값을 바탕으로 보정된 정밀 예측값이 산출되었습니다.")
+                st.success("🎯 최종 보정 예측이 완료되었습니다. 아래 표에서 결과를 확인하세요.")
                 
                 result_df = work_df.copy()
                 result_df['보정된_예측_EE'] = final_preds
                 st.dataframe(result_df[['reference_doi', 'lipid_molar_ratio', 'encapsulation_efficiency_percent_std_num', '보정된_예측_EE']].head(15))
                 
                 csv_data = result_df.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button("📥 결과 CSV 전체 다운로드", csv_data, "lnp_anchored_predictions_k3.csv", "text/csv", use_container_width=True)
+                st.download_button("📥 결과 CSV 전체 다운로드", csv_data, "lnp_anchored_predictions.csv", "text/csv", use_container_width=True)
         else:
-            st.warning("먼저 3개의 앵커 조성을 선택하고 실제 측정 EE(%)를 입력하세요.")
-
+            st.warning("선택된 앵커 수와 실측값 수가 일치하지 않거나 누락되었습니다.")
 
 # ==========================================================================
 # 탭 5 — 🎯 최적화 (캐싱 적용)
 # ==========================================================================
 with tab_opt:
     if len(work_df) > 10:
-        # 💡 [패치 4] 스피너 없이 미리 캐싱된 베이스 모델을 0.1초 만에 즉시 가져옴
         base_model = cached_model(work_df)
         tab_optimize(st, work_df, base_model, v3_module=v3)
     else:
@@ -415,7 +432,6 @@ with tab_what:
 # ==========================================================================
 with tab_peg_view:
     if len(work_df) > 10:
-        # F2.get_working_df를 통해 이미 dedupe된 상태이므로 work_df를 그대로 넘깁니다.
         tab_peg(st, work_df)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
