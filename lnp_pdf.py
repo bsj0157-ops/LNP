@@ -632,6 +632,7 @@ def detect_order(text):
 # 10. 몰비 파싱
 # ==========================================================================
 
+# 💡 [패치] 문장 끝 마침표로 인해 마지막 소수점 성분이 잘리는 문제 해결
 RATIO_RE = re.compile(
     r"""
     (?<!\d)
@@ -644,7 +645,7 @@ RATIO_RE = re.compile(
             \d+(?:\.\d+)?
         ){2,3}
     )
-    (?!\d)
+    (?!\d)(?!\.\d)
     """,
     re.X,
 )
@@ -1120,7 +1121,7 @@ def _find_metadata(
 
         lines = [
             _clean(x)
-            for x in pages[0][
+            for x in pages[
                 "text"
             ].splitlines()
             if _clean(x)
