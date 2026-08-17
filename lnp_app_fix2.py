@@ -406,6 +406,117 @@ def icc1(work_df):
     return float((ms_b - ms_w) / (ms_b + (k0 - 1) * ms_w))
 
 
+def anchored_full_table(work_df, v3_module, anchor_module, anchor_idx, anchor_y,
+                        n_splits=5):
+    """앵커 보정 예측을 **전 행**에 대해, 정직한 값으로 만듭니다.
+
+    표에 학습=예측 값을 그대로 보여주면 모델이 답을 외운 값이라
+    실제보다 2.4배 정확해 보입니다. 그래서 여기서는 각 행의 예측을
+    **그 행이 속한 논문을 학습에서 제외한 채로** 계산합니다
+    (논문 단위 out-of-fold). 새 논문에 기대할 수 있는 값과 같은 조건입니다.
+
+    앵커 보정은 앵커 행들의 (실측 − 예측) 중앙값을 offset 으로 잡아
+    **같은 논문의 다른 행**에 더합니다. 앵커링의 실제 용법입니다.
+    앵커와 다른 논문의 행에는 offset 을 적용하지 않습니다 — 다른 랩의
+    영점을 가져다 쓸 근거가 없기 때문입니다.
+
+    반환: (표 DataFrame, 요약 dict)
+    """
+    import numpy as np
+    import pandas as pd
+    from sklearn.compose import ColumnTransformer
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.impute import SimpleImputer
+    from sklearn.metrics import mean_absolute_error
+    from sklearn.model_selection import GroupKFold, cross_val_predict
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+    X, y, groups, num_cols, cat_cols = build_eval_matrix(work_df, v3_module)
+
+    steps = [("n", Pipeline([("i", SimpleImputer(strategy="median")),
+                             ("s", StandardScaler())]), num_cols)]
+    if cat_cols:
+        steps.append(("c", Pipeline([("i", SimpleImputer(strategy="most_frequent")),
+                                     ("o", OneHotEncoder(handle_unknown="ignore",
+                                                         min_frequency=2))]), cat_cols))
+    model = Pipeline([("pre", ColumnTransformer(steps)),
+                      ("m", RandomForestRegressor(n_estimators=400, min_samples_leaf=3,
+                                                  max_features=0.5, random_state=42,
+                                                  n_jobs=-1))])
+
+    k = int(min(n_splits, groups.nunique()))
+    if k < 2:
+        return None, {"error": "논문이 2편 미만이라 out-of-fold 예측을 만들 수 없습니다."}
+    oof = cross_val_predict(model, X, y, cv=GroupKFold(n_splits=k), groups=groups)
+    oof = pd.Series(oof, index=y.index)
+
+    # 앵커 위치를 build_eval_matrix 가 남긴 행으로 옮깁니다.
+    # build_eval_matrix 는 EE 결측 행을 버리므로 위치가 어긋날 수 있습니다.
+    pos_of = {p: i for i, p in enumerate(y.index)}
+    a_pairs = [(pos_of[p], v) for p, v in zip(anchor_idx or [], anchor_y or [])
+               if p in pos_of]
+
+    offset, anchor_paper = 0.0, None
+    if a_pairs:
+        a_pos = [p for p, _ in a_pairs]
+        resid = [v - oof.iloc[p] for p, v in a_pairs]
+        offset = float(np.median(resid))
+        papers = {groups.iloc[p] for p in a_pos}
+        anchor_paper = list(papers)[0] if len(papers) == 1 else None
+
+    same = (groups == anchor_paper) if anchor_paper is not None else pd.Series(
+        False, index=groups.index)
+    adj = oof + np.where(same.values, offset, 0.0)
+
+    tab = pd.DataFrame({
+        "논문 DOI": work_df.loc[y.index, "reference_doi"].values,
+        "지질 몰비": work_df.loc[y.index, "lipid_molar_ratio"].values,
+        "실측 EE (%)": y.values.round(1),
+        "예측 EE (%)": oof.values.round(1),
+        "앵커 보정 예측 (%)": np.asarray(adj).round(1),
+        "오차 (%p)": (np.asarray(adj) - y.values).round(1),
+    })
+    tab.insert(0, "앵커", ["⚓" if i in set(a_pos if a_pairs else []) else ""
+                          for i in range(len(tab))])
+    tab.insert(1, "앵커 논문", np.where(same.values, "✓", ""))
+
+    ev = ~same.values if anchor_paper is not None else np.ones(len(y), bool)
+    if a_pairs:
+        ev_same = same.values.copy()
+        for p, _ in a_pairs:
+            ev_same[p] = False          # 앵커 자신은 평가에서 제외
+    else:
+        ev_same = np.zeros(len(y), bool)
+
+    # 앵커가 여러 논문에 걸쳐 있으면 offset 을 적용할 대상이 없습니다.
+    # 앵커링은 '한 논문의 영점'을 잡는 절차이므로 같은 논문이어야 합니다.
+    warn = None
+    if a_pairs and anchor_paper is None:
+        warn = ("앵커 행들이 서로 다른 논문입니다. 앵커링은 한 논문의 영점을 "
+                "잡는 절차라서 보정이 어느 행에도 적용되지 않았습니다. "
+                "같은 논문에서 앵커를 고르십시오.")
+    elif not a_pairs:
+        warn = "앵커가 없어 보정 없이 out-of-fold 예측만 표시합니다."
+
+    summary = {
+        "n_rows": int(len(tab)),
+        "offset": offset,
+        "anchor_paper": anchor_paper,
+        "warning": warn,
+        "mae_all": float(mean_absolute_error(y.values, adj)),
+        "mae_other_papers": (float(mean_absolute_error(y.values[ev], np.asarray(adj)[ev]))
+                             if ev.sum() else None),
+        "mae_anchor_paper": (float(mean_absolute_error(y.values[ev_same],
+                                                       np.asarray(adj)[ev_same]))
+                             if ev_same.sum() else None),
+        "mae_anchor_paper_noanchor": (float(mean_absolute_error(
+            y.values[ev_same], oof.values[ev_same])) if ev_same.sum() else None),
+        "n_dropped": int(len(work_df) - len(tab)),
+    }
+    return tab, summary
+
+
 def show_persistence_warning(st):
     """배포 환경의 데이터 저장 한계를 사용자에게 알립니다."""
     st.warning(
