@@ -34,7 +34,7 @@ from app_tabs_optimize import tab_optimize, tab_whatif
 import lnp_peg as PG
 from app_tab_peg import tab_peg
 
-# 💡 [패치 1~7 적용] 새로운 픽스 모듈 불러오기 (이름 오타 수정 완료)
+# 💡 새로운 픽스 모듈 & 저장소 모듈 불러오기
 import lnp_app_fix2 as F2
 import lnp_store as ST
 
@@ -50,40 +50,37 @@ st.set_page_config(page_title="LNP Data Studio", page_icon="🧪", layout="wide"
 DATA_FILE = "lnp_web_data.csv"
 
 # --------------------------------------------------------------------------
-# 상태
+# 상태 및 데이터 저장 (Google Sheets 연동 지원)
 # --------------------------------------------------------------------------
 def _empty():
     return pd.DataFrame(columns=LE.COLS)
 
-if "df" not in st.session_state:
-    if os.path.exists(DATA_FILE):
-        st.session_state.df = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
-    else:
-        st.session_state.df = _empty()
-
-# 💡 [패치 G] Secrets에 맞춰 store 객체 자동 생성
 store = ST.get_store(st)
 
+# 💡 [패치 A] 통합된 초기화 로직: Store 로드를 최우선으로, 없으면 로컬 백업 호출
 if "df" not in st.session_state:
     loaded = store.load()
+    if loaded is None and os.path.exists(DATA_FILE):
+        try:
+            loaded = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
+        except:
+            loaded = None
     st.session_state.df = loaded if loaded is not None else _empty()
 
 def save_disk():
-    # 💡 [패치 G] 기존 로컬 파일 저장 대신 외부 store에 저장
     store.save(st.session_state.df)
 
 def add_rows(new: pd.DataFrame):
     cur = st.session_state.df
     out = pd.concat([cur, new], ignore_index=True)
-    # 💡 [패치 D] Key Error를 막는 안전한 컬럼 재정렬
     head = [c for c in LE.COLS if c in out.columns]
     st.session_state.df = out[head + [c for c in out.columns if c not in head]]
     save_disk()
 
-# 💡 [패치 1] 모든 탭이 같은 데이터를 쓰도록 work_df 생성
+# 💡 모든 탭이 같은 데이터를 쓰도록 work_df 생성
 work_df, work_info = F2.get_working_df(st.session_state.df, patch_mod=P)
 
-# 💡 [패치 4] 초고속 렌더링을 위한 모델 캐싱
+# 💡 초고속 렌더링을 위한 모델 캐싱
 cached_model = F2.make_cached_base_model(st, v3)
 
 # --------------------------------------------------------------------------
@@ -91,7 +88,6 @@ cached_model = F2.make_cached_base_model(st, v3)
 # --------------------------------------------------------------------------
 st.sidebar.title("🧪 LNP Data Studio")
 
-# 💡 [에러 수정 완료] ST.show_store_status에 st.sidebar 대신 st를 넘겨 충돌 방지
 ST.show_store_status(st, store)
 F2.show_persistence_warning(st.sidebar)
 
@@ -114,14 +110,22 @@ st.sidebar.caption(
     "서로 닮아 있습니다. 무작위로 나누면 성능이 부풀려지므로 논문 단위로 "
     "나눠야 하고, 그때 실질 표본 수는 행 수가 아니라 논문 수입니다.")
 
-# 💡 [패치 7] 정확도 한계 및 특성 알림
 st.sidebar.markdown(F2.ACCURACY_NOTE)
 
 if len(st.session_state.df):
-    buf = io.StringIO()
-    st.session_state.df.to_csv(buf, index=False)
-    st.sidebar.download_button("전체 CSV 내려받기", buf.getvalue().encode("utf-8-sig"),
-                               "lnp_data.csv", "text/csv", use_container_width=True)
+    st.sidebar.divider()
+    # 💡 [패치 F] 다운로드 버튼 2종류로 분리 (정제본 vs 원본)
+    buf_work = io.StringIO()
+    work_df.to_csv(buf_work, index=False)
+    st.sidebar.download_button(f"정제 데이터 내려받기 ({len(work_df)}행)", 
+                               buf_work.getvalue().encode("utf-8-sig"),
+                               "lnp_data_clean.csv", "text/csv", use_container_width=True)
+    
+    buf_raw = io.StringIO()
+    st.session_state.df.to_csv(buf_raw, index=False)
+    st.sidebar.download_button(f"원본 전체 내려받기 ({len(st.session_state.df)}행)", 
+                               buf_raw.getvalue().encode("utf-8-sig"),
+                               "lnp_data_raw.csv", "text/csv", use_container_width=True)
 
 tab_pdf, tab_form, tab_data, tab_model, tab_opt, tab_what, tab_peg_view = st.tabs(
     ["📄 PDF 업로드", "✍️ 직접 입력", "📊 데이터 관리", "🤖 모델 실행", "🎯 최적화", "⚖️ What-If", "📉 PEG 비율 변경"])
@@ -237,7 +241,6 @@ with tab_form:
 with tab_data:
     st.header("데이터 관리")
     
-    # 💡 [패치 1] 원본 df와 work_df 일치 여부 안내
     F2.show_data_consistency(st, work_df, st.session_state.df)
 
     up2 = st.file_uploader("기존 CSV 불러오기 (표준 형식으로 자동 정렬 및 정제)", type=["csv"], key="csvup")
@@ -280,20 +283,23 @@ with tab_data:
             st.success("✅ 중복 제거 후 안전하게 추가되었습니다.")
             st.rerun()
             
+        # 💡 [패치 E] 교체 시 전체 데이터 날림 방지
         if c2.button("기존 데이터를 이 파일로 교체"):
-            valid_d = d_clean.dropna(subset=[ee_col])
-            valid_d = P.dedupe(valid_d)
-            st.session_state.df = valid_d
-            save_disk()
-            st.success("✅ 파일이 중복 제거된 표준 형식으로 교체되었습니다.")
-            st.rerun()
+            valid_d = P.dedupe(d_clean.dropna(subset=[ee_col]))
+            if len(valid_d) == 0:
+                st.error("추가할 수 있는 행이 없습니다(EE 수치 없음). 교체하지 않았습니다.")
+            elif len(valid_d) < len(st.session_state.df) * 0.5:
+                st.warning(f"현재 {len(st.session_state.df)}행 → {len(valid_d)}행으로 절반 이하가 됩니다.")
+                if st.checkbox("그래도 위험을 감수하고 교체합니다"):
+                    st.session_state.df = valid_d; save_disk(); st.rerun()
+            else:
+                st.session_state.df = valid_d; save_disk(); st.rerun()
 
     st.divider()
     st.subheader("📝 엑셀에서 바로 복사/붙여넣기")
     if len(st.session_state.df) == 0:
         st.info("아직 데이터가 없습니다.")
     else:
-        # 데이터 관리 탭에서만 편집을 위해 원본 session_state.df를 넘김
         ed = st.data_editor(st.session_state.df, num_rows="dynamic", use_container_width=True, key="main_edit", height=380)
         
         b1, b2, b3 = st.columns(3)
@@ -355,7 +361,6 @@ with tab_model:
         c2.metric("baseline MAE", f"{mae_b:.2f} %p")
         c3.metric("개선율", f"{gain:+.1f} %", delta=f"{'유의미' if gain > 5 else '미미'}")
 
-        # 💡 [패치 C] 정식 ICC(1) 계산식 적용
         icc = F2.icc1(work_df)
         st.write(f"**논문 간 분산 비중(ICC) = {icc:.2f}**")
 
@@ -376,42 +381,47 @@ with tab_model:
     st.subheader("⚓ 앵커링 (영점 조절) 기반 정밀 예측")
     st.markdown("AI가 추천하는 조성으로 실험하거나, 원하는 조성을 직접 지정하여 영점을 조절합니다.")
     
-    anchor_idx, anchor_y = F2.anchor_selector(st, work_df, n=3)
+    # 💡 [패치 C] 앵커 선택 전 논문을 먼저 필터링하도록 수정
+    papers = sorted(work_df["reference_doi"].dropna().astype(str).unique())
+    sel_paper = st.selectbox("📌 앵커를 고를 기준 논문 선택", ["(선택하세요)"] + papers)
+    
+    if sel_paper != "(선택하세요)":
+        sub_df = work_df[work_df["reference_doi"].astype(str) == sel_paper]
+        # sub_df 내부의 행 위치를 이용해 앵커 선택
+        anchor_idx_sub, anchor_y = F2.anchor_selector(st, sub_df, n=3, key_prefix="anc_sub")
+        # 선택된 sub_df 내 인덱스를 실제 work_df의 전체 인덱스로 변환
+        anchor_idx = sub_df.iloc[anchor_idx_sub].index.tolist() if anchor_idx_sub else []
+        
+        if st.button("영점 조절 후 전체 예측 실행 (다운로드)", type="primary"):
+            if anchor_idx and anchor_y and len(anchor_idx) == len(anchor_y):
+                with st.spinner("정직한 Out-of-fold 예측 및 앵커링 검증 중... (약 15~20초 소요)"):
+                    
+                    # 💡 [패치 B, C, D] In-sample 과적합을 배제한 전체 554행 정밀 예측표 생성
+                    tab, summ = F2.anchored_full_table(work_df, v3, lnp_anchor, anchor_idx, anchor_y)
+                    
+                    if summ.get("warning"):
+                        st.warning(summ["warning"])
+                        
+                    st.divider()
+                    st.write("### 📊 앵커링 실전 검증 리포트 및 최종 결과표")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("전체 논문 MAE", f"{summ['mae_all']:.1f} %p")
+                    if summ.get("mae_anchor_paper") is not None:
+                        c2.metric("앵커 논문 (보정 후)", f"{summ['mae_anchor_paper']:.1f} %p")
+                        c3.metric("앵커 논문 (보정 전)", f"{summ['mae_anchor_paper_noanchor']:.1f} %p")
+                        
+                    st.caption(f"영점 보정량 **{summ['offset']:+.1f} %p** — 앵커와 같은 논문의 행에만 적용되었습니다. 다른 논문에 다른 랩의 영점을 가져다 쓸 근거가 없기 때문입니다.")
 
-    if st.button("영점 조절 후 전체 예측 실행 (다운로드)", type="primary"):
-        # 💡 [패치 E] 정확히 3개가 아니어도 1~2개 앵커 허용
-        if anchor_idx and anchor_y and len(anchor_idx) == len(anchor_y):
-            with st.spinner("정직한 앵커링 검증 및 정밀 예측 중..."):
-                
-                # 💡 [패치 A, B] 인샘플 오차가 아닌, 진짜 홀드아웃 리포트 출력
-                rep = F2.anchored_holdout_report(work_df, v3, lnp_anchor, anchor_idx, anchor_y)
-                
-                st.divider()
-                st.write("### 📊 앵커링 실전 검증 리포트")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("논문 단위 CV MAE", f"{rep['holdout']:.1f} %p", help="새 논문에 기대할 수 있는 일반적인 오차입니다")
-                
-                if rep.get("anchored_holdout") is not None:
-                    c2.metric("앵커 적용 (같은 논문)", f"{rep['anchored_holdout']:.1f} %p")
-                    c3.metric("앵커 없음 (같은 논문)", f"{rep['holdout_same_paper']:.1f} %p")
-                
-                st.caption(f"⚠️ 참고: 기존 방식(학습=예측) 기준 오차는 {rep['in_sample']:.1f} %p 였습니다. 이는 모델이 답을 외운 낙관적 수치이므로 실제 정확도로 오인하지 마십시오.")
-
-                X_feat, n_cols, c_cols = v3.build_features(work_df, include_measured=False)
-                m_anchor = lnp_anchor.AnchoredEEPredictor(v3, n_cols, c_cols)
-                m_anchor.fit(X_feat, work_df["encapsulation_efficiency_percent_std_num"])
-                
-                final_preds = m_anchor.predict(X_feat, anchor_idx=anchor_idx, anchor_y=anchor_y)
-                st.success("🎯 최종 보정 예측이 완료되었습니다. 아래 표에서 결과를 확인하세요.")
-                
-                result_df = work_df.copy()
-                result_df['보정된_예측_EE'] = final_preds
-                st.dataframe(result_df[['reference_doi', 'lipid_molar_ratio', 'encapsulation_efficiency_percent_std_num', '보정된_예측_EE']].head(15))
-                
-                csv_data = result_df.to_csv(index=False, encoding='utf-8-sig')
-                st.download_button("📥 결과 CSV 전체 다운로드", csv_data, "lnp_anchored_predictions.csv", "text/csv", use_container_width=True)
-        else:
-            st.warning("선택된 앵커 수와 실측값 수가 일치하지 않거나 누락되었습니다.")
+                    st.dataframe(tab, use_container_width=True, height=520)
+                    
+                    st.download_button("결과 CSV 전체 내려받기",
+                                       tab.to_csv(index=False).encode("utf-8-sig"),
+                                       "lnp_anchored_predictions.csv", "text/csv",
+                                       use_container_width=True)
+            else:
+                st.warning("선택된 앵커 수와 실측값 수가 일치하지 않거나 누락되었습니다.")
+    else:
+        st.info("먼저 앵커를 고를 논문을 선택해주세요.")
 
 # ==========================================================================
 # 탭 5 — 🎯 최적화 (캐싱 적용)
