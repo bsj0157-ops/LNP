@@ -57,7 +57,7 @@ def _empty():
 
 store = ST.get_store(st)
 
-# 💡 [패치 A] 통합된 초기화 로직: Store 로드를 최우선으로, 없으면 로컬 백업 호출
+# 통합된 초기화 로직: Store 로드를 최우선으로, 없으면 로컬 백업 호출
 if "df" not in st.session_state:
     loaded = store.load()
     if loaded is None and os.path.exists(DATA_FILE):
@@ -77,10 +77,10 @@ def add_rows(new: pd.DataFrame):
     st.session_state.df = out[head + [c for c in out.columns if c not in head]]
     save_disk()
 
-# 💡 모든 탭이 같은 데이터를 쓰도록 work_df 생성
+# 모든 탭이 같은 데이터를 쓰도록 work_df 생성
 work_df, work_info = F2.get_working_df(st.session_state.df, patch_mod=P)
 
-# 💡 초고속 렌더링을 위한 모델 캐싱
+# 초고속 렌더링을 위한 모델 캐싱
 cached_model = F2.make_cached_base_model(st, v3)
 
 # --------------------------------------------------------------------------
@@ -110,11 +110,12 @@ st.sidebar.caption(
     "서로 닮아 있습니다. 무작위로 나누면 성능이 부풀려지므로 논문 단위로 "
     "나눠야 하고, 그때 실질 표본 수는 행 수가 아니라 논문 수입니다.")
 
-st.sidebar.markdown(F2.ACCURACY_NOTE)
+# 💡 [패치 5-2(b)] 저EE 구간 예측 한계 문구를 ACCURACY_NOTE에 동적 추가
+accuracy_note_appended = F2.ACCURACY_NOTE + "\n| 구간별 정확도 | EE 70~85% 구간 7.0 %p / 50% 미만 구간 44.3 %p — 저EE 처방 예측은 신뢰하기 어렵습니다 |"
+st.sidebar.markdown(accuracy_note_appended)
 
 if len(st.session_state.df):
     st.sidebar.divider()
-    # 💡 [패치 F] 다운로드 버튼 2종류로 분리 (정제본 vs 원본)
     buf_work = io.StringIO()
     work_df.to_csv(buf_work, index=False)
     st.sidebar.download_button(f"정제 데이터 내려받기 ({len(work_df)}행)", 
@@ -172,8 +173,11 @@ with tab_pdf:
                 st.divider()
                 st.subheader("표 편집 후 추가")
                 draft = LP.to_draft_rows(ex)
+                
+                # 💡 [패치 5-5] 대소문자 혼용 방지를 위한 DOI 정규화
                 if doi:
-                    draft["reference_doi"] = doi
+                    draft["reference_doi"] = doi.strip().lower()
+                    
                 edited = st.data_editor(draft, num_rows="dynamic", use_container_width=True, key="pdf_edit")
 
                 if st.button("이 행들을 데이터에 추가", type="primary"):
@@ -221,13 +225,15 @@ with tab_form:
         ok = st.form_submit_button("추가", type="primary")
 
     if ok:
-        if not doi.strip():
+        # 💡 [패치 5-5] 입력 폼 제출 시 DOI 정규화
+        clean_doi = doi.strip().lower()
+        if not clean_doi:
             st.error("DOI가 필요합니다. 논문 단위 CV의 기준입니다.")
         elif not ratio.strip():
             st.error("몰비가 필요합니다.")
         else:
             e = LE.Entry()
-            e.paper(doi.strip())
+            e.paper(clean_doi)
             e.add(ratio.strip(), ee, ion=ion.strip() or None, helper=helper.strip() or None, peg=peg.strip() or None, cargo=cargo or None, np_ratio=npr or None, ph=ph or None)
             new = e.to_frame()
             with st.spinner("SMILES 조회 중..."):
@@ -283,7 +289,6 @@ with tab_data:
             st.success("✅ 중복 제거 후 안전하게 추가되었습니다.")
             st.rerun()
             
-        # 💡 [패치 E] 교체 시 전체 데이터 날림 방지
         if c2.button("기존 데이터를 이 파일로 교체"):
             valid_d = P.dedupe(d_clean.dropna(subset=[ee_col]))
             if len(valid_d) == 0:
@@ -309,6 +314,14 @@ with tab_data:
                 valid_ed = valid_ed[valid_ed["lipid_molar_ratio"].astype(str).str.strip() != ""]
             else:
                 valid_ed = ed
+            
+            # 💡 [패치 5-5] EE 누락 행 알림
+            ee_col_name = "encapsulation_efficiency_percent_std_num"
+            if ee_col_name in valid_ed.columns:
+                n_no_ee = pd.to_numeric(valid_ed[ee_col_name].map(P.robust_ee), errors="coerce").isna().sum()
+                if n_no_ee > 0:
+                    st.caption(f"⚠️ {n_no_ee}행은 EE 수치가 없어 모델 학습에는 쓰이지 않습니다 (저장은 정상적으로 유지됩니다).")
+            
             st.session_state.df = valid_ed
             save_disk()
             st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
@@ -381,22 +394,18 @@ with tab_model:
     st.subheader("⚓ 앵커링 (영점 조절) 기반 정밀 예측")
     st.markdown("AI가 추천하는 조성으로 실험하거나, 원하는 조성을 직접 지정하여 영점을 조절합니다.")
     
-    # 💡 [패치 C] 앵커 선택 전 논문을 먼저 필터링하도록 수정
     papers = sorted(work_df["reference_doi"].dropna().astype(str).unique())
     sel_paper = st.selectbox("📌 앵커를 고를 기준 논문 선택", ["(선택하세요)"] + papers)
     
     if sel_paper != "(선택하세요)":
         sub_df = work_df[work_df["reference_doi"].astype(str) == sel_paper]
-        # sub_df 내부의 행 위치를 이용해 앵커 선택
         anchor_idx_sub, anchor_y = F2.anchor_selector(st, sub_df, n=3, key_prefix="anc_sub")
-        # 선택된 sub_df 내 인덱스를 실제 work_df의 전체 인덱스로 변환
         anchor_idx = sub_df.iloc[anchor_idx_sub].index.tolist() if anchor_idx_sub else []
         
         if st.button("영점 조절 후 전체 예측 실행 (다운로드)", type="primary"):
             if anchor_idx and anchor_y and len(anchor_idx) == len(anchor_y):
                 with st.spinner("정직한 Out-of-fold 예측 및 앵커링 검증 중... (약 15~20초 소요)"):
                     
-                    # 💡 [패치 B, C, D] In-sample 과적합을 배제한 전체 554행 정밀 예측표 생성
                     tab, summ = F2.anchored_full_table(work_df, v3, lnp_anchor, anchor_idx, anchor_y)
                     
                     if summ.get("warning"):
