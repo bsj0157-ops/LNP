@@ -188,20 +188,32 @@ def df_fingerprint(df):
 # ==========================================================================
 # 2. 탭4를 v3 특징으로 통일
 # ==========================================================================
-def build_eval_matrix(work_df, v3_module):
+def build_eval_matrix(work_df, v3_module, include_measured=False):
     """탭4의 자체 파싱을 v3.build_features 로 교체합니다.
 
     측정 결과 v3 특징이 더 정확합니다(MAE 16.43 vs 17.07 %p).
     무엇보다 탭5·6이 쓰는 것과 같은 특징이라, 탭4가 보고하는 성능이
     실제로 다른 탭의 성능을 뜻하게 됩니다.
 
-    반환: (X, y, groups, num_cols, cat_cols)
+    ``include_measured`` 는 입자 크기·PDI·제타전위를 특징에 넣습니다.
+    **용도에 따라 달라야 합니다.**
+
+    - ``False`` (설계): 아직 만들지 않은 처방의 EE 를 예측할 때.
+      크기·PDI 는 입자를 만든 뒤에야 알 수 있으므로 쓸 수 없습니다.
+      최적화·What-If·PEG 탭이 이 경우입니다.
+    - ``True`` (검증): 이미 만든 입자의 EE 를 맞힐 때. 크기·PDI 를
+      이미 측정했으므로 써도 됩니다. 앵커링 탭이 이 경우입니다.
+
+    실측(554행, 논문 단위 5-fold CV):
+      조성만 16.46 → 크기 추가 15.74 → 크기·PDI·제타 15.67 %p (4.8% 개선).
+      크기 값이 있는 507행만 따로 평가해도 17.26 → 16.64 %p 로 같은 방향입니다.
     """
     y = normalize_ee(work_df[EE_COL])
     keep = y.notna()
     d = work_df[keep].reset_index(drop=True)
     y = y[keep].reset_index(drop=True)
-    X, num_cols, cat_cols = v3_module.build_features(d, include_measured=False)
+    X, num_cols, cat_cols = v3_module.build_features(
+        d, include_measured=include_measured)
     g = d[DOI_COL].astype(str).str.strip().str.lower()
     return X, y, g, num_cols, cat_cols
 
@@ -407,7 +419,7 @@ def icc1(work_df):
 
 
 def anchored_full_table(work_df, v3_module, anchor_module, anchor_idx, anchor_y,
-                        n_splits=5):
+                        n_splits=5, include_measured=True):
     """앵커 보정 예측을 **전 행**에 대해, 정직한 값으로 만듭니다.
 
     표에 학습=예측 값을 그대로 보여주면 모델이 답을 외운 값이라
@@ -432,7 +444,10 @@ def anchored_full_table(work_df, v3_module, anchor_module, anchor_idx, anchor_y,
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-    X, y, groups, num_cols, cat_cols = build_eval_matrix(work_df, v3_module)
+    # 앵커링은 '이미 만든 입자'의 EE 를 맞히는 용도이므로 크기·PDI 를
+    # 씁니다(실측 16.46 → 15.67 %p). 설계 탭과는 다릅니다.
+    X, y, groups, num_cols, cat_cols = build_eval_matrix(
+        work_df, v3_module, include_measured=include_measured)
 
     steps = [("n", Pipeline([("i", SimpleImputer(strategy="median")),
                              ("s", StandardScaler())]), num_cols)]
@@ -480,6 +495,16 @@ def anchored_full_table(work_df, v3_module, anchor_module, anchor_idx, anchor_y,
     tab.insert(0, "앵커", ["⚓" if i in set(a_pos if a_pairs else []) else ""
                           for i in range(len(tab))])
     tab.insert(1, "앵커 논문", np.where(same.values, "✓", ""))
+
+    # 예측 신뢰도 — 실측 구간별 오차가 크게 다릅니다(554행 CV 측정).
+    #   0~50%: MAE 44.3 / 50~70%: 19.1 / 70~85%: 7.0 / 85~95%: 10.0 / 95~100%: 14.8
+    # 저EE 처방은 데이터가 적고(79행) 소수 논문에 몰려 있어 예측이 거칠습니다.
+    # 사용자가 표의 저EE 예측을 그대로 믿지 않도록 등급을 붙입니다.
+    pv = np.asarray(adj)
+    grade = np.where(pv < 50, "낮음 (참고용)",
+             np.where(pv < 70, "보통",
+              np.where(pv < 95, "높음", "보통")))
+    tab["예측 신뢰도"] = grade
 
     ev = ~same.values if anchor_paper is not None else np.ones(len(y), bool)
     if a_pairs:
