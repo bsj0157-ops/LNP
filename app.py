@@ -84,7 +84,30 @@ if "df" not in st.session_state:
 def save_disk():
     store.save(st.session_state.df)
 
-# 💡 [패치] 심사 로직이 포함된 스마트한 데이터 추가 함수
+# 💡 [방어막 추가 및 TypeError 패치] 5성분 처방이 입력될 경우 앞 4성분으로 안전하게 축약하는 가드 함수
+def guard(df: pd.DataFrame) -> pd.DataFrame:
+    if "lipid_molar_ratio" not in df.columns:
+        return df
+    
+    fixed, notes = [], []
+    
+    repair_notes_col = df.get("repair_note", pd.Series([""] * len(df))).fillna("").astype(str)
+    
+    for s, ext_note in zip(df["lipid_molar_ratio"].astype(str), repair_notes_col):
+        g, note = AH.reduce_to_four(s)
+        fixed.append(g)
+        
+        if ext_note.lower() == "nan":
+            ext_note = ""
+            
+        combined_note = ext_note
+        if note:
+            combined_note = (ext_note + " | " + note) if ext_note else note
+        notes.append(combined_note)
+        
+    df = df.assign(lipid_molar_ratio=fixed, repair_note=notes)
+    return df[df["lipid_molar_ratio"] != ""]
+
 def add_rows(new_rows: pd.DataFrame):
     res = GD.screen_new_rows(new_rows, st.session_state.df, reduce_fn=AH.reduce_to_four)
     
@@ -353,9 +376,69 @@ with tab_data:
             st.rerun()
 
 # ==========================================================================
-# 탭 4 — 모델 실행 및 앵커링 (새로운 T2 렌더러 적용)
+# 탭 4 — 모델 실행 및 앵커링
 # ==========================================================================
 with tab_model:
+    st.header("모델 실행")
+    st.caption("논문 단위 교차검증으로 평가합니다. 무작위 분할은 성능을 부풀리므로 쓰지 않습니다.")
+
+    if n_pap < 5:
+        st.warning(f"논문이 {n_pap}편입니다. 논문 단위 5-fold CV에는 최소 5편 이상이 필요합니다.")
+
+    if st.button("평가 실행", type="primary", disabled=(n_pap < 3)):
+        from sklearn.compose import ColumnTransformer
+        from sklearn.dummy import DummyRegressor
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.impute import SimpleImputer
+        from sklearn.metrics import mean_absolute_error
+        from sklearn.model_selection import GroupKFold, cross_val_predict
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import OneHotEncoder, StandardScaler
+        from scipy.stats import spearmanr
+
+        X, y, groups, num_cols, cat_cols = F2.build_eval_matrix(work_df, v3)
+
+        pre = ColumnTransformer([
+            ("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols),
+            ("c", Pipeline([("i", SimpleImputer(strategy="most_frequent")),
+                            ("o", OneHotEncoder(handle_unknown="ignore", min_frequency=2))]), cat_cols)]
+            if cat_cols else
+            [("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols)])
+        
+        model = Pipeline([("pre", pre),
+                          ("m", RandomForestRegressor(n_estimators=400, min_samples_leaf=3, max_features=0.5, random_state=42, n_jobs=-1))])
+
+        k = min(5, groups.nunique())
+        cv = GroupKFold(n_splits=k)
+        with st.spinner("교차검증 중..."):
+            pm = cross_val_predict(model, X, y, cv=cv, groups=groups)
+            pb = cross_val_predict(DummyRegressor(strategy="mean"), X, y, cv=cv, groups=groups)
+
+        mae_m, mae_b = mean_absolute_error(y, pm), mean_absolute_error(y, pb)
+        gain = (mae_b - mae_m) / mae_b * 100
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("모델 MAE", f"{mae_m:.2f} %p")
+        c2.metric("baseline MAE", f"{mae_b:.2f} %p")
+        c3.metric("개선율", f"{gain:+.1f} %", delta=f"{'유의미' if gain > 5 else '미미'}")
+
+        icc = F2.icc1(work_df)
+        st.write(f"**논문 간 분산 비중(ICC) = {icc:.2f}**")
+
+        rhos = [spearmanr(y.loc[idx], pd.Series(pm, index=y.index).loc[idx])[0] 
+                for gid, idx in y.groupby(groups).groups.items() if len(idx) >= 4]
+        rhos = [r for r in rhos if not np.isnan(r)]
+        
+        if rhos:
+            st.success(f"**논문 내 순위 상관 중앙값 rho = {np.median(rhos):.2f}** ({sum(r > 0 for r in rhos)}/{len(rhos)}편에서 양수)")
+
+        res = pd.DataFrame({"실측 EE": y, "예측 EE": pm, "논문": groups})
+        st.scatter_chart(res, x="실측 EE", y="예측 EE")
+
+    # ==========================================
+    # ⚓ 앵커링 (새로운 T2 렌더러 적용)
+    # ==========================================
+    st.divider()
     T2.render(st, work_df, v3, F2, oof_series=oof)
 
 # ==========================================================================
