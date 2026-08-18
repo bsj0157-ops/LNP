@@ -13,6 +13,7 @@
 #    5. 최적화       — 앵커 영점 기반 최적 레시피 탐색
 #    6. What-If      — 특정 성분 비율 변경에 따른 효과 시뮬레이션
 #    7. PEG 비율 변경 — PEG 변경에 따른 신뢰할 수 있는 구간 예측
+#    8. 🤖 자동 수집  — PMC 오픈액세스에서 논문 자동 검색 및 정제 후 추가
 # ==========================================================================
 
 import io
@@ -34,9 +35,11 @@ from app_tabs_optimize import tab_optimize, tab_whatif
 import lnp_peg as PG
 from app_tab_peg import tab_peg
 
-# 💡 새로운 픽스 모듈 & 저장소 모듈 불러오기
+# 💡 새로운 픽스 모듈 & 저장소 모듈 & 자동 수집 탭 모듈 불러오기
 import lnp_app_fix2 as F2
 import lnp_store as ST
+import lnp_autoharvest as AH
+import app_tab_harvest as TH
 
 try:
     import lnp_pdf as LP
@@ -70,9 +73,35 @@ if "df" not in st.session_state:
 def save_disk():
     store.save(st.session_state.df)
 
+# 💡 [방어막 추가] 5성분 처방이 입력될 경우 앞 4성분으로 안전하게 축약하는 가드 함수
+def guard(df: pd.DataFrame) -> pd.DataFrame:
+    if "lipid_molar_ratio" not in df.columns:
+        return df
+    
+    fixed, notes = [], []
+    for s, ext_note in zip(df["lipid_molar_ratio"].astype(str), df.get("repair_note", [""] * len(df))):
+        g, note = AH.reduce_to_four(s)
+        fixed.append(g)
+        # 기존 repair_note가 있다면 보존하고 새로 추가된 note를 덧붙임
+        combined_note = ext_note
+        if note:
+            combined_note = (ext_note + " | " + note) if ext_note else note
+        notes.append(combined_note)
+        
+    df = df.assign(lipid_molar_ratio=fixed, repair_note=notes)
+    # 축약이 불가능하여 빈칸이 된 행(5번째 성분이 15% 이상인 경우)은 모델 학습을 깨뜨리므로 안전하게 제외
+    return df[df["lipid_molar_ratio"] != ""]
+
 def add_rows(new: pd.DataFrame):
     cur = st.session_state.df
-    out = pd.concat([cur, new], ignore_index=True)
+    # 💡 데이터베이스에 합치기 전 무조건 방어막(guard) 통과
+    new_guarded = guard(new)
+    
+    if new_guarded.empty and not new.empty:
+        st.error("입력하신 데이터가 5성분 비율 제한(15% 초과)에 걸려 모델 안전을 위해 추가되지 않았습니다.")
+        return
+        
+    out = pd.concat([cur, new_guarded], ignore_index=True)
     head = [c for c in LE.COLS if c in out.columns]
     st.session_state.df = out[head + [c for c in out.columns if c not in head]]
     save_disk()
@@ -110,7 +139,7 @@ st.sidebar.caption(
     "서로 닮아 있습니다. 무작위로 나누면 성능이 부풀려지므로 논문 단위로 "
     "나눠야 하고, 그때 실질 표본 수는 행 수가 아니라 논문 수입니다.")
 
-# 💡 [패치 5-2(b)] 저EE 구간 예측 한계 문구를 ACCURACY_NOTE에 동적 추가
+# 저EE 구간 예측 한계 문구를 ACCURACY_NOTE에 동적 추가
 accuracy_note_appended = F2.ACCURACY_NOTE + "\n| 구간별 정확도 | EE 70~85% 구간 7.0 %p / 50% 미만 구간 44.3 %p — 저EE 처방 예측은 신뢰하기 어렵습니다 |"
 st.sidebar.markdown(accuracy_note_appended)
 
@@ -128,8 +157,9 @@ if len(st.session_state.df):
                                buf_raw.getvalue().encode("utf-8-sig"),
                                "lnp_data_raw.csv", "text/csv", use_container_width=True)
 
-tab_pdf, tab_form, tab_data, tab_model, tab_opt, tab_what, tab_peg_view = st.tabs(
-    ["📄 PDF 업로드", "✍️ 직접 입력", "📊 데이터 관리", "🤖 모델 실행", "🎯 최적화", "⚖️ What-If", "📉 PEG 비율 변경"])
+# 💡 자동 수집 탭 추가
+tab_pdf, tab_form, tab_data, tab_model, tab_opt, tab_what, tab_peg_view, tab_harvest = st.tabs(
+    ["📄 PDF 업로드", "✍️ 직접 입력", "📊 데이터 관리", "🤖 모델 실행", "🎯 최적화", "⚖️ What-If", "📉 PEG 비율", "🤖 자동 수집"])
 
 # ==========================================================================
 # 탭 1 — PDF 업로드
@@ -174,7 +204,6 @@ with tab_pdf:
                 st.subheader("표 편집 후 추가")
                 draft = LP.to_draft_rows(ex)
                 
-                # 💡 [패치 5-5] 대소문자 혼용 방지를 위한 DOI 정규화
                 if doi:
                     draft["reference_doi"] = doi.strip().lower()
                     
@@ -225,7 +254,6 @@ with tab_form:
         ok = st.form_submit_button("추가", type="primary")
 
     if ok:
-        # 💡 [패치 5-5] 입력 폼 제출 시 DOI 정규화
         clean_doi = doi.strip().lower()
         if not clean_doi:
             st.error("DOI가 필요합니다. 논문 단위 CV의 기준입니다.")
@@ -296,9 +324,12 @@ with tab_data:
             elif len(valid_d) < len(st.session_state.df) * 0.5:
                 st.warning(f"현재 {len(st.session_state.df)}행 → {len(valid_d)}행으로 절반 이하가 됩니다.")
                 if st.checkbox("그래도 위험을 감수하고 교체합니다"):
-                    st.session_state.df = valid_d; save_disk(); st.rerun()
+                    # 교체 시에도 방어막 적용
+                    guarded_valid_d = guard(valid_d)
+                    st.session_state.df = guarded_valid_d; save_disk(); st.rerun()
             else:
-                st.session_state.df = valid_d; save_disk(); st.rerun()
+                guarded_valid_d = guard(valid_d)
+                st.session_state.df = guarded_valid_d; save_disk(); st.rerun()
 
     st.divider()
     st.subheader("📝 엑셀에서 바로 복사/붙여넣기")
@@ -315,14 +346,15 @@ with tab_data:
             else:
                 valid_ed = ed
             
-            # 💡 [패치 5-5] EE 누락 행 알림
             ee_col_name = "encapsulation_efficiency_percent_std_num"
             if ee_col_name in valid_ed.columns:
                 n_no_ee = pd.to_numeric(valid_ed[ee_col_name].map(P.robust_ee), errors="coerce").isna().sum()
                 if n_no_ee > 0:
                     st.caption(f"⚠️ {n_no_ee}행은 EE 수치가 없어 모델 학습에는 쓰이지 않습니다 (저장은 정상적으로 유지됩니다).")
             
-            st.session_state.df = valid_ed
+            # 편집 저장 시에도 방어막 적용
+            guarded_ed = guard(valid_ed)
+            st.session_state.df = guarded_ed
             save_disk()
             st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
             st.rerun()
@@ -460,3 +492,10 @@ with tab_peg_view:
         tab_peg(st, work_df)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
+
+# ==========================================================================
+# 탭 8 — 🤖 자동 수집 탭 연결
+# ==========================================================================
+with tab_harvest:
+    # 데이터 추가 처리는 기존의 방어막이 쳐진 add_rows 함수를 사용합니다.
+    TH.render(work_df, on_add=add_rows)
