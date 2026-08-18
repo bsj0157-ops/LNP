@@ -9,7 +9,7 @@
 #    1. PDF 업로드   — 논문 PDF에서 후보를 뽑아 표로 보여주고 확인 후 추가
 #    2. 직접 입력    — 폼으로 한 줄씩 입력 (SMILES 자동 조회)
 #    3. 데이터 관리  — 전체 표 편집, 검증, CSV 업로드/다운로드
-#    4. 모델 실행    — 논문 단위 CV + 진단 + 순위 평가
+#    4. 모델 실행    — 논문 단위 CV + 진단 + 순위 평가 및 앵커링
 #    5. 최적화       — 앵커 영점 기반 최적 레시피 탐색
 #    6. What-If      — 특정 성분 비율 변경에 따른 효과 시뮬레이션
 #    7. PEG 비율 변경 — PEG 변경에 따른 신뢰할 수 있는 구간 예측
@@ -35,11 +35,15 @@ from app_tabs_optimize import tab_optimize, tab_whatif
 import lnp_peg as PG
 from app_tab_peg import tab_peg
 
-# 💡 새로운 픽스 모듈 & 저장소 모듈 & 자동 수집 탭 모듈 불러오기
+# 💡 새로운 모듈 통합
 import lnp_app_fix2 as F2
 import lnp_store as ST
 import lnp_autoharvest as AH
 import app_tab_harvest as TH
+import lnp_app_cache as C
+import lnp_app_guard as GD
+import lnp_anchor2 as A2
+import app_tab_anchor2 as T2
 
 try:
     import lnp_pdf as LP
@@ -60,65 +64,51 @@ def _empty():
 
 store = ST.get_store(st)
 
-# 통합된 초기화 로직: Store 로드를 최우선으로, 없으면 로컬 백업 호출
+# 통합된 초기화 로직: 예외(Bare except) 구체화
 if "df" not in st.session_state:
-    loaded = store.load()
+    try:
+        loaded = store.load()
+    except Exception as e:
+        st.caption(f"Store load 에러 발생: {e}")
+        loaded = None
+
     if loaded is None and os.path.exists(DATA_FILE):
         try:
             loaded = pd.read_csv(DATA_FILE, encoding="utf-8-sig")
-        except:
+        except Exception as e:
+            st.caption(f"로컬 파일 읽기 에러 발생: {e}")
             loaded = None
+
     st.session_state.df = loaded if loaded is not None else _empty()
 
 def save_disk():
     store.save(st.session_state.df)
 
-# 💡 [방어막 추가 및 TypeError 패치] 5성분 처방이 입력될 경우 앞 4성분으로 안전하게 축약하는 가드 함수
-def guard(df: pd.DataFrame) -> pd.DataFrame:
-    if "lipid_molar_ratio" not in df.columns:
-        return df
+# 💡 [패치] 심사 로직이 포함된 스마트한 데이터 추가 함수
+def add_rows(new_rows: pd.DataFrame):
+    res = GD.screen_new_rows(new_rows, st.session_state.df, reduce_fn=AH.reduce_to_four)
     
-    fixed, notes = [], []
-    
-    # 💡 [핵심 수정] repair_note 컬럼의 결측치(NaN)를 빈 문자열로 안전하게 채우고 강제 변환합니다.
-    repair_notes_col = df.get("repair_note", pd.Series([""] * len(df))).fillna("").astype(str)
-    
-    for s, ext_note in zip(df["lipid_molar_ratio"].astype(str), repair_notes_col):
-        g, note = AH.reduce_to_four(s)
-        fixed.append(g)
+    for m in res["messages"]:
+        st.info(m)
         
-        # ext_note가 "nan" 문자열로 변환되었을 경우를 대비해 한 번 더 빈칸 처리
-        if ext_note.lower() == "nan":
-            ext_note = ""
-            
-        # 기존 repair_note가 있다면 보존하고 새로 추가된 note를 덧붙임
-        combined_note = ext_note
-        if note:
-            combined_note = (ext_note + " | " + note) if ext_note else note
-        notes.append(combined_note)
+    if len(res["rejected"]):
+        st.caption("⚠️ 아래 행은 추가되지 않았습니다.")
+        st.dataframe(res["rejected"][["why"] + [c for c in new_rows.columns if c in res["rejected"].columns]])
         
-    df = df.assign(lipid_molar_ratio=fixed, repair_note=notes)
-    # 축약이 불가능하여 빈칸이 된 행(5번째 성분이 15% 이상인 경우)은 모델 학습을 깨뜨리므로 안전하게 제외
-    return df[df["lipid_molar_ratio"] != ""]
+    if not res["accepted"].empty:
+        st.session_state.df = pd.concat([st.session_state.df, res["accepted"]], ignore_index=True)
+        save_disk()
+        st.success(f"{len(res['accepted'])}행 추가 및 저장 완료.")
+        st.rerun()
 
-def add_rows(new: pd.DataFrame):
-    cur = st.session_state.df
-    # 💡 데이터베이스에 합치기 전 무조건 방어막(guard) 통과
-    new_guarded = guard(new)
-    
-    if new_guarded.empty and not new.empty:
-        st.error("입력하신 데이터가 5성분 비율 제한(15% 초과)에 걸려 모델 안전을 위해 추가되지 않았습니다.")
-        return
-        
-    out = pd.concat([cur, new_guarded], ignore_index=True)
-    head = [c for c in LE.COLS if c in out.columns]
-    st.session_state.df = out[head + [c for c in out.columns if c not in head]]
-    save_disk()
+# --------------------------------------------------------------------------
+# 💡 [패치] 캐시 시스템 설치 및 실행
+# --------------------------------------------------------------------------
+cached = C.install(st, F2, v3, P)
+work_df, work_info = cached["working_df"](st.session_state.df)
+oof = cached["oof"](work_df)
 
-# 모든 탭이 같은 데이터를 쓰도록 work_df 생성
-work_df, work_info = F2.get_working_df(st.session_state.df, patch_mod=P)
-
-# 초고속 렌더링을 위한 모델 캐싱
+# 초고속 렌더링을 위한 기존 모델 캐싱 (호환성 유지)
 cached_model = F2.make_cached_base_model(st, v3)
 
 # --------------------------------------------------------------------------
@@ -148,7 +138,6 @@ st.sidebar.caption(
     "서로 닮아 있습니다. 무작위로 나누면 성능이 부풀려지므로 논문 단위로 "
     "나눠야 하고, 그때 실질 표본 수는 행 수가 아니라 논문 수입니다.")
 
-# 저EE 구간 예측 한계 문구를 ACCURACY_NOTE에 동적 추가
 accuracy_note_appended = F2.ACCURACY_NOTE + "\n| 구간별 정확도 | EE 70~85% 구간 7.0 %p / 50% 미만 구간 44.3 %p — 저EE 처방 예측은 신뢰하기 어렵습니다 |"
 st.sidebar.markdown(accuracy_note_appended)
 
@@ -166,7 +155,7 @@ if len(st.session_state.df):
                                buf_raw.getvalue().encode("utf-8-sig"),
                                "lnp_data_raw.csv", "text/csv", use_container_width=True)
 
-# 💡 자동 수집 탭 추가
+# 탭 구성
 tab_pdf, tab_form, tab_data, tab_model, tab_opt, tab_what, tab_peg_view, tab_harvest = st.tabs(
     ["📄 PDF 업로드", "✍️ 직접 입력", "📊 데이터 관리", "🤖 모델 실행", "🎯 최적화", "⚖️ What-If", "📉 PEG 비율", "🤖 자동 수집"])
 
@@ -175,7 +164,7 @@ tab_pdf, tab_form, tab_data, tab_model, tab_opt, tab_what, tab_peg_view, tab_har
 # ==========================================================================
 with tab_pdf:
     st.header("논문 PDF에서 데이터 뽑기")
-    st.warning("**자동 입력기가 아니라 초안 작성기입니다.** LNP 논문의 EE 값은 상당수가 그림(막대그래프)에만 있고 본문 텍스트에는 없습니다. 조성 성분 순서도 논문마다 달라서, 뽑아낸 값은 반드시 근거 문장을 보고 확인해야 합니다. 목표는 타이핑을 줄이는 것이지 검토를 없애는 것이 아닙니다.")
+    st.warning("**자동 입력기가 아니라 초안 작성기입니다.** LNP 논문의 EE 값은 상당수가 그림(막대그래프)에만 있고 본문 텍스트에는 없습니다. 조성 성분 순서도 논문마다 달라서, 뽑아낸 값은 반드시 근거 문장을 보고 확인해야 합니다.")
 
     if not PDF_OK:
         st.error(f"PDF 모듈을 못 불러왔습니다: {PDF_ERR}\n\n`pip install pdfplumber pypdf` 후 다시 실행하세요.")
@@ -227,8 +216,6 @@ with tab_pdf:
                         with st.spinner("SMILES 조회 중..."):
                             keep = LE.resolve_smiles(keep, verbose=False)
                         add_rows(keep)
-                        st.success(f"{len(keep)}행 추가했습니다.")
-                        st.rerun()
 
 # ==========================================================================
 # 탭 2 — 직접 입력
@@ -276,7 +263,6 @@ with tab_form:
             with st.spinner("SMILES 조회 중..."):
                 new = LE.resolve_smiles(new, verbose=False)
             add_rows(new)
-            st.success(f"추가했습니다.")
 
 # ==========================================================================
 # 탭 3 — 데이터 관리
@@ -289,56 +275,58 @@ with tab_data:
     up2 = st.file_uploader("기존 CSV 불러오기 (표준 형식으로 자동 정렬 및 정제)", type=["csv"], key="csvup")
     if up2 is not None:
         raw = up2.read()
+        d_raw = None
         for enc in ("utf-8-sig", "cp949", "latin-1"):
             try:
                 d_raw = pd.read_csv(io.BytesIO(raw), encoding=enc)
                 break
-            except: continue
-        
-        d_clean = pd.DataFrame(columns=st.session_state.df.columns)
-        for col in st.session_state.df.columns:
-            if col in d_raw.columns:
-                d_clean[col] = d_raw[col]
-            else:
-                d_clean[col] = np.nan
-        
-        ee_col = "encapsulation_efficiency_percent_std_num"
-        d_clean[ee_col] = d_clean[ee_col].map(P.robust_ee)
-        
-        num_cols = ["np_ratio_std_num", "buffer_ph_std_num", "particle_size_nm_std_num", "pdi_std_num", "zeta_potential_mv_std_num"]
-        for col in num_cols:
-            if col in d_clean.columns:
-                d_clean[col] = pd.to_numeric(d_clean[col], errors='coerce')
+            except Exception as e:
+                parse_err = e
+                continue
+                
+        if d_raw is None:
+            st.error(f"CSV 파싱 에러 발생: {parse_err}")
+        else:
+            d_clean = pd.DataFrame(columns=st.session_state.df.columns)
+            for col in st.session_state.df.columns:
+                if col in d_raw.columns:
+                    d_clean[col] = d_raw[col]
+                else:
+                    d_clean[col] = np.nan
+            
+            ee_col = "encapsulation_efficiency_percent_std_num"
+            d_clean[ee_col] = d_clean[ee_col].map(P.robust_ee)
+            
+            num_cols = ["np_ratio_std_num", "buffer_ph_std_num", "particle_size_nm_std_num", "pdi_std_num", "zeta_potential_mv_std_num"]
+            for col in num_cols:
+                if col in d_clean.columns:
+                    d_clean[col] = pd.to_numeric(d_clean[col], errors='coerce')
 
-        st.write("---")
-        st.subheader("가져온 데이터 미리보기 (자동 정제됨)")
-        st.dataframe(d_clean.head(5))
-        
-        n_invalid = d_clean[ee_col].isna().sum()
-        if n_invalid > 0:
-            st.warning(f"⚠️ 경고: {n_invalid}개 행은 EE 수치가 없어서 추가에서 제외됩니다.")
+            st.write("---")
+            st.subheader("가져온 데이터 미리보기 (자동 정제됨)")
+            st.dataframe(d_clean.head(5))
             
-        c1, c2 = st.columns(2)
-        if c1.button(f"정상 데이터 {len(d_clean) - n_invalid}행 추가하기"):
-            valid_d = d_clean.dropna(subset=[ee_col])
-            valid_d = P.dedupe(valid_d)
-            add_rows(valid_d)
-            st.success("✅ 중복 제거 후 안전하게 추가되었습니다.")
-            st.rerun()
-            
-        if c2.button("기존 데이터를 이 파일로 교체"):
-            valid_d = P.dedupe(d_clean.dropna(subset=[ee_col]))
-            if len(valid_d) == 0:
-                st.error("추가할 수 있는 행이 없습니다(EE 수치 없음). 교체하지 않았습니다.")
-            elif len(valid_d) < len(st.session_state.df) * 0.5:
-                st.warning(f"현재 {len(st.session_state.df)}행 → {len(valid_d)}행으로 절반 이하가 됩니다.")
-                if st.checkbox("그래도 위험을 감수하고 교체합니다"):
-                    # 교체 시에도 방어막 적용
-                    guarded_valid_d = guard(valid_d)
-                    st.session_state.df = guarded_valid_d; save_disk(); st.rerun()
-            else:
-                guarded_valid_d = guard(valid_d)
-                st.session_state.df = guarded_valid_d; save_disk(); st.rerun()
+            n_invalid = d_clean[ee_col].isna().sum()
+            if n_invalid > 0:
+                st.warning(f"⚠️ 경고: {n_invalid}개 행은 EE 수치가 없어서 추가에서 제외됩니다.")
+                
+            c1, c2 = st.columns(2)
+            if c1.button(f"정상 데이터 {len(d_clean) - n_invalid}행 추가하기"):
+                valid_d = d_clean.dropna(subset=[ee_col])
+                add_rows(valid_d)
+                
+            if c2.button("기존 데이터를 이 파일로 교체"):
+                valid_d = d_clean.dropna(subset=[ee_col])
+                if len(valid_d) == 0:
+                    st.error("추가할 수 있는 행이 없습니다(EE 수치 없음). 교체하지 않았습니다.")
+                elif len(valid_d) < len(st.session_state.df) * 0.5:
+                    st.warning(f"현재 {len(st.session_state.df)}행 → {len(valid_d)}행으로 절반 이하가 됩니다.")
+                    if st.checkbox("그래도 위험을 감수하고 교체합니다"):
+                        st.session_state.df = _empty()
+                        add_rows(valid_d)
+                else:
+                    st.session_state.df = _empty()
+                    add_rows(valid_d)
 
     st.divider()
     st.subheader("📝 엑셀에서 바로 복사/붙여넣기")
@@ -355,126 +343,23 @@ with tab_data:
             else:
                 valid_ed = ed
             
-            ee_col_name = "encapsulation_efficiency_percent_std_num"
-            if ee_col_name in valid_ed.columns:
-                n_no_ee = pd.to_numeric(valid_ed[ee_col_name].map(P.robust_ee), errors="coerce").isna().sum()
-                if n_no_ee > 0:
-                    st.caption(f"⚠️ {n_no_ee}행은 EE 수치가 없어 모델 학습에는 쓰이지 않습니다 (저장은 정상적으로 유지됩니다).")
-            
-            # 편집 저장 시에도 방어막 적용
-            guarded_ed = guard(valid_ed)
-            st.session_state.df = guarded_ed
+            # 교체 전 검증
+            res = GD.screen_new_rows(valid_ed, _empty(), reduce_fn=AH.reduce_to_four)
+            if len(res["rejected"]):
+                st.warning(f"{len(res['rejected'])}개의 불량 행이 감지되어 제거되었습니다.")
+            st.session_state.df = res["accepted"]
             save_disk()
             st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
             st.rerun()
 
 # ==========================================================================
-# 탭 4 — 모델 실행 및 앵커링
+# 탭 4 — 모델 실행 및 앵커링 (새로운 T2 렌더러 적용)
 # ==========================================================================
 with tab_model:
-    st.header("모델 실행")
-    st.caption("논문 단위 교차검증으로 평가합니다. 무작위 분할은 성능을 부풀리므로 쓰지 않습니다.")
-
-    if n_pap < 5:
-        st.warning(f"논문이 {n_pap}편입니다. 논문 단위 5-fold CV에는 최소 5편 이상이 필요합니다.")
-
-    if st.button("평가 실행", type="primary", disabled=(n_pap < 3)):
-        from sklearn.compose import ColumnTransformer
-        from sklearn.dummy import DummyRegressor
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.impute import SimpleImputer
-        from sklearn.metrics import mean_absolute_error
-        from sklearn.model_selection import GroupKFold, cross_val_predict
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import OneHotEncoder, StandardScaler
-        from scipy.stats import spearmanr
-
-        X, y, groups, num_cols, cat_cols = F2.build_eval_matrix(work_df, v3)
-
-        pre = ColumnTransformer([
-            ("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols),
-            ("c", Pipeline([("i", SimpleImputer(strategy="most_frequent")),
-                            ("o", OneHotEncoder(handle_unknown="ignore", min_frequency=2))]), cat_cols)]
-            if cat_cols else
-            [("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols)])
-        
-        model = Pipeline([("pre", pre),
-                          ("m", RandomForestRegressor(n_estimators=400, min_samples_leaf=3, max_features=0.5, random_state=42, n_jobs=-1))])
-
-        k = min(5, groups.nunique())
-        cv = GroupKFold(n_splits=k)
-        with st.spinner("교차검증 중..."):
-            pm = cross_val_predict(model, X, y, cv=cv, groups=groups)
-            pb = cross_val_predict(DummyRegressor(strategy="mean"), X, y, cv=cv, groups=groups)
-
-        mae_m, mae_b = mean_absolute_error(y, pm), mean_absolute_error(y, pb)
-        gain = (mae_b - mae_m) / mae_b * 100
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("모델 MAE", f"{mae_m:.2f} %p")
-        c2.metric("baseline MAE", f"{mae_b:.2f} %p")
-        c3.metric("개선율", f"{gain:+.1f} %", delta=f"{'유의미' if gain > 5 else '미미'}")
-
-        icc = F2.icc1(work_df)
-        st.write(f"**논문 간 분산 비중(ICC) = {icc:.2f}**")
-
-        rhos = [spearmanr(y.loc[idx], pd.Series(pm, index=y.index).loc[idx])[0] 
-                for gid, idx in y.groupby(groups).groups.items() if len(idx) >= 4]
-        rhos = [r for r in rhos if not np.isnan(r)]
-        
-        if rhos:
-            st.success(f"**논문 내 순위 상관 중앙값 rho = {np.median(rhos):.2f}** ({sum(r > 0 for r in rhos)}/{len(rhos)}편에서 양수)")
-
-        res = pd.DataFrame({"실측 EE": y, "예측 EE": pm, "논문": groups})
-        st.scatter_chart(res, x="실측 EE", y="예측 EE")
-
-    # ==========================================
-    # ⚓ 앵커링 (실측 영점 조절) 기능 탭
-    # ==========================================
-    st.divider()
-    st.subheader("⚓ 앵커링 (영점 조절) 기반 정밀 예측")
-    st.markdown("AI가 추천하는 조성으로 실험하거나, 원하는 조성을 직접 지정하여 영점을 조절합니다.")
-    
-    papers = sorted(work_df["reference_doi"].dropna().astype(str).unique())
-    sel_paper = st.selectbox("📌 앵커를 고를 기준 논문 선택", ["(선택하세요)"] + papers)
-    
-    if sel_paper != "(선택하세요)":
-        sub_df = work_df[work_df["reference_doi"].astype(str) == sel_paper]
-        anchor_idx_sub, anchor_y = F2.anchor_selector(st, sub_df, n=3, key_prefix="anc_sub")
-        anchor_idx = sub_df.iloc[anchor_idx_sub].index.tolist() if anchor_idx_sub else []
-        
-        if st.button("영점 조절 후 전체 예측 실행 (다운로드)", type="primary"):
-            if anchor_idx and anchor_y and len(anchor_idx) == len(anchor_y):
-                with st.spinner("정직한 Out-of-fold 예측 및 앵커링 검증 중... (약 15~20초 소요)"):
-                    
-                    tab, summ = F2.anchored_full_table(work_df, v3, lnp_anchor, anchor_idx, anchor_y)
-                    
-                    if summ.get("warning"):
-                        st.warning(summ["warning"])
-                        
-                    st.divider()
-                    st.write("### 📊 앵커링 실전 검증 리포트 및 최종 결과표")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("전체 논문 MAE", f"{summ['mae_all']:.1f} %p")
-                    if summ.get("mae_anchor_paper") is not None:
-                        c2.metric("앵커 논문 (보정 후)", f"{summ['mae_anchor_paper']:.1f} %p")
-                        c3.metric("앵커 논문 (보정 전)", f"{summ['mae_anchor_paper_noanchor']:.1f} %p")
-                        
-                    st.caption(f"영점 보정량 **{summ['offset']:+.1f} %p** — 앵커와 같은 논문의 행에만 적용되었습니다. 다른 논문에 다른 랩의 영점을 가져다 쓸 근거가 없기 때문입니다.")
-
-                    st.dataframe(tab, use_container_width=True, height=520)
-                    
-                    st.download_button("결과 CSV 전체 내려받기",
-                                       tab.to_csv(index=False).encode("utf-8-sig"),
-                                       "lnp_anchored_predictions.csv", "text/csv",
-                                       use_container_width=True)
-            else:
-                st.warning("선택된 앵커 수와 실측값 수가 일치하지 않거나 누락되었습니다.")
-    else:
-        st.info("먼저 앵커를 고를 논문을 선택해주세요.")
+    T2.render(st, work_df, v3, F2, oof_series=oof)
 
 # ==========================================================================
-# 탭 5 — 🎯 최적화 (캐싱 적용)
+# 탭 5 — 🎯 최적화
 # ==========================================================================
 with tab_opt:
     if len(work_df) > 10:
@@ -484,7 +369,7 @@ with tab_opt:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
 
 # ==========================================================================
-# 탭 6 — ⚖️ What-If (캐싱 적용)
+# 탭 6 — ⚖️ What-If
 # ==========================================================================
 with tab_what:
     if len(work_df) > 10:
@@ -506,5 +391,4 @@ with tab_peg_view:
 # 탭 8 — 🤖 자동 수집 탭 연결
 # ==========================================================================
 with tab_harvest:
-    # 데이터 추가 처리는 기존의 방어막이 쳐진 add_rows 함수를 사용합니다.
     TH.render(work_df, on_add=add_rows)
