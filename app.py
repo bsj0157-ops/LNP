@@ -73,15 +73,24 @@ if "df" not in st.session_state:
 def save_disk():
     store.save(st.session_state.df)
 
-# 💡 [방어막 추가] 5성분 처방이 입력될 경우 앞 4성분으로 안전하게 축약하는 가드 함수
+# 💡 [방어막 추가 및 TypeError 패치] 5성분 처방이 입력될 경우 앞 4성분으로 안전하게 축약하는 가드 함수
 def guard(df: pd.DataFrame) -> pd.DataFrame:
     if "lipid_molar_ratio" not in df.columns:
         return df
     
     fixed, notes = [], []
-    for s, ext_note in zip(df["lipid_molar_ratio"].astype(str), df.get("repair_note", [""] * len(df))):
+    
+    # 💡 [핵심 수정] repair_note 컬럼의 결측치(NaN)를 빈 문자열로 안전하게 채우고 강제 변환합니다.
+    repair_notes_col = df.get("repair_note", pd.Series([""] * len(df))).fillna("").astype(str)
+    
+    for s, ext_note in zip(df["lipid_molar_ratio"].astype(str), repair_notes_col):
         g, note = AH.reduce_to_four(s)
         fixed.append(g)
+        
+        # ext_note가 "nan" 문자열로 변환되었을 경우를 대비해 한 번 더 빈칸 처리
+        if ext_note.lower() == "nan":
+            ext_note = ""
+            
         # 기존 repair_note가 있다면 보존하고 새로 추가된 note를 덧붙임
         combined_note = ext_note
         if note:
