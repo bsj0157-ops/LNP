@@ -133,6 +133,20 @@ def render(st, work_df, v3_module, fix2_module, oof_series=None):
     info = A2.offset_reliability(resid, n_predict=len(pred_sub) - len(picks))
     off = info["offset"]
 
+    # 영점을 세션에 게시해 설계 탭(최적화·What-If·PEG)이 쓸 수 있게 합니다.
+    # off 는 A2.shrunk_offset 에서 이미 축소된 값이므로 already_shrunk=True 로
+    # 넘겨야 합니다 — 그렇지 않으면 publish 가 축소를 한 번 더 걸어 영점이
+    # 의도의 67~75% 로 줄어듭니다.
+    # ref_pred 는 그 논문 전체 행의 예측 중앙값입니다. 여유 비례 보정의
+    # 기준점이므로 반드시 넘기십시오(기본값 80.0 은 논문마다 크게 다릅니다).
+    try:
+        import lnp_offset_bus as OB
+        OB.publish(st, raw_offset=off, k=info["n_anchor"], paper=str(sel),
+                   n_rows_paper=len(sub), already_shrunk=True,
+                   ref_pred=float(pred_sub.median()))
+    except Exception as _e:
+        st.caption(f"영점 전파 실패(설계 탭은 보정 없이 동작합니다): {_e}")
+
     m1, m2, m3 = st.columns(3)
     m1.metric("영점 보정량", f"{off:+.1f} %p",
               help="앵커 잔차의 중앙값에 축소를 적용한 값입니다.")
