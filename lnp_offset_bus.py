@@ -211,10 +211,18 @@ def banner(st, *, context: str = "absolute") -> float:
                 "보려면 앵커링 탭에서 영점을 잡으십시오.")
         return 0.0
 
+    # 💡 [핵심 패치] 탭마다 고유한 Key를 생성하도록 카운터 도입
+    if "ob_key_counter" not in st.session_state:
+        st.session_state.ob_key_counter = 0
+    st.session_state.ob_key_counter += 1
+    
+    unique_key = f"ob_on_{context}_{st.session_state.ob_key_counter}"
+
     on = st.checkbox(
         f"앵커 영점 {rec['shrunk']:+.1f} %p 적용 "
         f"(앵커 {rec['k']}개 · {str(rec['paper'])[:38]})",
-        value=True, key=f"ob_on_{context}")
+        value=True, key=unique_key)
+        
     if not on:
         return 0.0
 
