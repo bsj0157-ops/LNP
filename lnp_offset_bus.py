@@ -72,7 +72,8 @@ def shrink(raw_offset: float, k: int) -> float:
 # ---------------------------------------------------------------- 저장·조회
 def publish(st, *, raw_offset: float, k: int, paper: str,
             n_rows_paper: int = None, mae_before: float = None,
-            mae_after: float = None, ref_pred: float = None) -> dict:
+            mae_after: float = None, ref_pred: float = None,
+            already_shrunk: bool = False) -> dict:
     """앵커링 탭에서 영점을 계산한 직후 호출합니다.
 
     ref_pred
@@ -84,8 +85,13 @@ def publish(st, *, raw_offset: float, k: int, paper: str,
     ...            paper=sel_paper, n_rows_paper=len(sub_df),
     ...            ref_pred=float(sub_pred.median()))
     """
+    # already_shrunk=True 는 raw_offset 이 이미 축소된 값(예: A2.shrunk_offset
+    # 또는 A2.offset_reliability()["offset"])일 때 씁니다. 이 플래그 없이
+    # 축소된 값을 넘기면 축소가 두 번 걸려 영점이 의도의 67~75% 로 줄어듭니다.
+    _shrunk = float(raw_offset) if already_shrunk else shrink(raw_offset, k)
     rec = {"raw": float(raw_offset), "k": int(k),
-           "shrunk": shrink(raw_offset, k), "paper": str(paper),
+           "shrunk": _shrunk, "already_shrunk": bool(already_shrunk),
+           "paper": str(paper),
            "n_rows_paper": n_rows_paper,
            "mae_before": mae_before, "mae_after": mae_after,
            "ref_pred": None if ref_pred is None else float(ref_pred),
@@ -212,9 +218,15 @@ def banner(st, *, context: str = "absolute") -> float:
     if not on:
         return 0.0
 
+    # already_shrunk 인 경우 raw 와 shrunk 가 같으므로 축소 문구가 무의미합니다.
+    w = rec["k"] / (rec["k"] + lambda_for(rec["k"]))
+    head = (f"앵커 {rec['k']}개에 맞춰 관측 잔차의 {w:.0%} 만 적용한 값입니다 "
+            f"(λ={lambda_for(rec['k'])})."
+            if rec.get("already_shrunk") else
+            f"원영점 {rec['raw']:+.1f} %p 를 앵커 {rec['k']}개에 맞춰 "
+            f"{rec['shrunk']:+.1f} %p 로 축소했습니다 (λ={lambda_for(rec['k'])}).")
     st.caption(
-        f"원영점 {rec['raw']:+.1f} %p 를 앵커 {rec['k']}개에 맞춰 "
-        f"{rec['shrunk']:+.1f} %p 로 축소했습니다 (λ={lambda_for(rec['k'])}). "
+        head + " "
         + ("영점은 절대값을 평행이동하며 **순위와 곡선 모양은 바뀌지 "
            "않습니다.**" if context == "absolute" else
            "영점은 **Δ 와 유의성 판정에는 영향이 없고** 전·후 절대값만 "
