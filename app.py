@@ -33,7 +33,7 @@ import lnp_app_patch as P
 import lnp_optimize as O
 from app_tabs_optimize import tab_optimize, tab_whatif
 import lnp_peg as PG
-from app_tab_peg import tab_peg
+import app_tab_peg as TP  # 💡 [패치] 화면 UI 모듈을 명시적으로 불러옵니다.
 
 # 💡 새로운 모듈 통합
 import lnp_app_fix2 as F2
@@ -440,8 +440,8 @@ with tab_what:
 
 with tab_peg_view:
     if len(work_df) > 10:
-        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출
-        TO.tab_peg_anchored(st, work_df, PG)
+        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출 (TP 모듈 전달)
+        TO.tab_peg_anchored(st, work_df, TP)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
 
