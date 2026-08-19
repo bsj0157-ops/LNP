@@ -33,7 +33,7 @@ import lnp_app_patch as P
 import lnp_optimize as O
 from app_tabs_optimize import tab_optimize, tab_whatif
 import lnp_peg as PG
-import app_tab_peg as TP  # 💡 [패치] 화면 UI 모듈을 명시적으로 불러옵니다.
+import app_tab_peg as TP
 
 # 💡 새로운 모듈 통합
 import lnp_app_fix2 as F2
@@ -44,9 +44,10 @@ import lnp_app_cache as C
 import lnp_app_guard as GD
 import lnp_anchor2 as A2
 import app_tab_anchor2 as T2
-
-# 💡 [핵심 패치] 영점 전파용 감싸개(Wrapper) 모듈 임포트
 import app_tabs_offset as TO
+
+# 💡 실시간 정확도 노트 모듈 임포트
+import lnp_app_livenote as LN
 
 try:
     import lnp_pdf as LP
@@ -67,7 +68,6 @@ def _empty():
 
 store = ST.get_store(st)
 
-# 통합된 초기화 로직: 예외(Bare except) 구체화
 if "df" not in st.session_state:
     try:
         loaded = store.load()
@@ -87,7 +87,6 @@ if "df" not in st.session_state:
 def save_disk():
     store.save(st.session_state.df)
 
-# 심사 로직이 포함된 스마트한 데이터 추가 함수
 def add_rows(new_rows: pd.DataFrame):
     res = GD.screen_new_rows(new_rows, st.session_state.df, reduce_fn=AH.reduce_to_four)
     
@@ -111,7 +110,6 @@ cached = C.install(st, F2, v3, P)
 work_df, work_info = cached["working_df"](st.session_state.df)
 oof = cached["oof"](work_df)
 
-# 초고속 렌더링을 위한 기존 모델 캐싱 (호환성 유지)
 cached_model = F2.make_cached_base_model(st, v3)
 
 # --------------------------------------------------------------------------
@@ -141,8 +139,8 @@ st.sidebar.caption(
     "서로 닮아 있습니다. 무작위로 나누면 성능이 부풀려지므로 논문 단위로 "
     "나눠야 하고, 그때 실질 표본 수는 행 수가 아니라 논문 수입니다.")
 
-accuracy_note_appended = F2.ACCURACY_NOTE + "\n| 구간별 정확도 | EE 70~85% 구간 7.0 %p / 50% 미만 구간 44.3 %p — 저EE 처방 예측은 신뢰하기 어렵습니다 |"
-st.sidebar.markdown(accuracy_note_appended)
+# 💡 실시간 구간별 정확도로 사이드바 동적 반영
+st.sidebar.markdown(LN.accuracy_note(work_df, oof, base_note=F2.ACCURACY_NOTE))
 
 if len(st.session_state.df):
     st.sidebar.divider()
@@ -346,10 +344,13 @@ with tab_data:
             else:
                 valid_ed = ed
             
-            # 교체 전 검증
+            # 교체 전 검증 및 안전 안내
             res = GD.screen_new_rows(valid_ed, _empty(), reduce_fn=AH.reduce_to_four)
             if len(res["rejected"]):
                 st.warning(f"{len(res['rejected'])}개의 불량 행이 감지되어 제거되었습니다.")
+            if len(res["accepted"]) < len(st.session_state.df):
+                st.info(f"중복 제거 등으로 인해 원본 {len(st.session_state.df)}행에서 {len(res['accepted'])}행으로 반영됩니다.")
+                
             st.session_state.df = res["accepted"]
             save_disk()
             st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
@@ -376,7 +377,8 @@ with tab_model:
         from sklearn.preprocessing import OneHotEncoder, StandardScaler
         from scipy.stats import spearmanr
 
-        X, y, groups, num_cols, cat_cols = F2.build_eval_matrix(work_df, v3)
+        # 💡 반복 호출로 인한 병목 제거: cached matrix 사용
+        X, y, groups, num_cols, cat_cols = cached["matrix"](work_df)
 
         pre = ColumnTransformer([
             ("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols),
@@ -416,16 +418,14 @@ with tab_model:
         st.scatter_chart(res, x="실측 EE", y="예측 EE")
 
     st.divider()
-    # 새로운 축소 앵커링 UI (이 안에서 OB.publish를 통해 세션 저장)
     T2.render(st, work_df, v3, F2, oof_series=oof)
 
 # ==========================================================================
-# 💡 [핵심 패치] 탭 5, 6, 7 — 영점 전파를 위한 감싸개(Wrapper) 적용
+# 탭 5, 6, 7 — 영점 전파를 위한 감싸개(Wrapper) 적용
 # ==========================================================================
 with tab_opt:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출
         TO.tab_optimize_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
@@ -433,14 +433,12 @@ with tab_opt:
 with tab_what:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출
         TO.tab_whatif_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
 
 with tab_peg_view:
     if len(work_df) > 10:
-        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출 (TP 모듈 전달)
         TO.tab_peg_anchored(st, work_df, TP)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
