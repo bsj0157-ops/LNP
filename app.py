@@ -10,9 +10,9 @@
 #    2. 직접 입력    — 폼으로 한 줄씩 입력 (SMILES 자동 조회)
 #    3. 데이터 관리  — 전체 표 편집, 검증, CSV 업로드/다운로드
 #    4. 모델 실행    — 논문 단위 CV + 진단 + 순위 평가 및 앵커링
-#    5. 최적화       — 앵커 영점 기반 최적 레시피 탐색
-#    6. What-If      — 특정 성분 비율 변경에 따른 효과 시뮬레이션
-#    7. PEG 비율 변경 — PEG 변경에 따른 신뢰할 수 있는 구간 예측
+#    5. 최적화       — 앵커 영점 기반 최적 레시피 탐색 (영점 동기화)
+#    6. What-If      — 특정 성분 비율 변경에 따른 효과 시뮬레이션 (영점 동기화)
+#    7. PEG 비율 변경 — PEG 변경에 따른 신뢰할 수 있는 구간 예측 (영점 동기화)
 #    8. 🤖 자동 수집  — PMC 오픈액세스에서 논문 자동 검색 및 정제 후 추가
 # ==========================================================================
 
@@ -44,6 +44,9 @@ import lnp_app_cache as C
 import lnp_app_guard as GD
 import lnp_anchor2 as A2
 import app_tab_anchor2 as T2
+
+# 💡 [핵심 패치] 영점 전파용 감싸개(Wrapper) 모듈 임포트
+import app_tabs_offset as TO
 
 try:
     import lnp_pdf as LP
@@ -84,30 +87,7 @@ if "df" not in st.session_state:
 def save_disk():
     store.save(st.session_state.df)
 
-# 💡 [방어막 추가 및 TypeError 패치] 5성분 처방이 입력될 경우 앞 4성분으로 안전하게 축약하는 가드 함수
-def guard(df: pd.DataFrame) -> pd.DataFrame:
-    if "lipid_molar_ratio" not in df.columns:
-        return df
-    
-    fixed, notes = [], []
-    
-    repair_notes_col = df.get("repair_note", pd.Series([""] * len(df))).fillna("").astype(str)
-    
-    for s, ext_note in zip(df["lipid_molar_ratio"].astype(str), repair_notes_col):
-        g, note = AH.reduce_to_four(s)
-        fixed.append(g)
-        
-        if ext_note.lower() == "nan":
-            ext_note = ""
-            
-        combined_note = ext_note
-        if note:
-            combined_note = (ext_note + " | " + note) if ext_note else note
-        notes.append(combined_note)
-        
-    df = df.assign(lipid_molar_ratio=fixed, repair_note=notes)
-    return df[df["lipid_molar_ratio"] != ""]
-
+# 심사 로직이 포함된 스마트한 데이터 추가 함수
 def add_rows(new_rows: pd.DataFrame):
     res = GD.screen_new_rows(new_rows, st.session_state.df, reduce_fn=AH.reduce_to_four)
     
@@ -125,7 +105,7 @@ def add_rows(new_rows: pd.DataFrame):
         st.rerun()
 
 # --------------------------------------------------------------------------
-# 💡 [패치] 캐시 시스템 설치 및 실행
+# 캐시 시스템 설치 및 실행
 # --------------------------------------------------------------------------
 cached = C.install(st, F2, v3, P)
 work_df, work_info = cached["working_df"](st.session_state.df)
@@ -435,38 +415,33 @@ with tab_model:
         res = pd.DataFrame({"실측 EE": y, "예측 EE": pm, "논문": groups})
         st.scatter_chart(res, x="실측 EE", y="예측 EE")
 
-    # ==========================================
-    # ⚓ 앵커링 (새로운 T2 렌더러 적용)
-    # ==========================================
     st.divider()
+    # 새로운 축소 앵커링 UI (이 안에서 OB.publish를 통해 세션 저장)
     T2.render(st, work_df, v3, F2, oof_series=oof)
 
 # ==========================================================================
-# 탭 5 — 🎯 최적화
+# 💡 [핵심 패치] 탭 5, 6, 7 — 영점 전파를 위한 감싸개(Wrapper) 적용
 # ==========================================================================
 with tab_opt:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        tab_optimize(st, work_df, base_model, v3_module=v3)
+        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출
+        TO.tab_optimize_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
 
-# ==========================================================================
-# 탭 6 — ⚖️ What-If
-# ==========================================================================
 with tab_what:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        tab_whatif(st, work_df, base_model, v3_module=v3)
+        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출
+        TO.tab_whatif_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
 
-# ==========================================================================
-# 탭 7 — 📉 PEG 비율 변경 
-# ==========================================================================
 with tab_peg_view:
     if len(work_df) > 10:
-        tab_peg(st, work_df)
+        # 순정 탭 함수 대신, 영점을 동기화하는 감싸개 호출
+        TO.tab_peg_anchored(st, work_df, PG)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
 
