@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 import lnp_optimize as O
+import lnp_uncertainty as U
 
 
 def _banner(st):
@@ -65,35 +66,48 @@ def tab_optimize(st, df, model, v3_module):
             st.error("조성을 읽을 수 없습니다.")
             return
 
-        n_tied = T.attrs.get("n_tied", 0)
+        # 💡 [핵심 패치] 신뢰도가 '매우 낮음'인 엉터리 처방 필터링
+        trust_mask = T["pred_sd"].apply(lambda s: U.label_for(s) != "매우 낮음")
+        filtered_T = T[trust_mask]
+        
+        n_tied = filtered_T.attrs.get("n_tied", 0) if hasattr(filtered_T, "attrs") else T.attrs.get("n_tied", 0)
         n_tot = T.attrs.get("n_grid_total", 0)
         span = T.attrs.get("grid_span", 0)
 
+        if len(filtered_T) < len(T):
+            st.warning(f"🚨 예측 신뢰도가 '매우 낮음'인 불안정한 레시피 {len(T) - len(filtered_T)}개를 상위 목록에서 제거했습니다.")
+            if len(filtered_T) == 0:
+                st.error("신뢰할 수 있는 예측 결과가 없습니다. 기준 처방이나 탐색 범위를 조정해 보세요.")
+                return
+
         st.warning(
-            f"**격자 {n_tot}개 중 {n_tied}개가 1등과 통계적으로 구별되지 "
+            f"**격자 {n_tot}개 중 상위 후보들이 통계적으로 구별되지 "
             f"않습니다.** 아래 순위는 참고용이며, 1등을 2등보다 낫다고 "
             f"말할 근거가 없습니다. (전체 격자 예측 폭 {span} %p, "
-            f"개별 불확실성 ±{T.pred_sd.mean():.1f} %p)")
+            f"개별 불확실성 ±{filtered_T.pred_sd.mean():.1f} %p)")
 
-        show = T.rename(columns={
+        show = filtered_T.rename(columns={
             "ionizable": "이온화(%)", "helper": "헬퍼(%)",
             "chol": "콜레스테롤(%)", "peg": "PEG(%)",
             "pred_ee": "예측 EE(%)", "pred_sd": "±불확실성",
             "delta_vs_template": "기준 대비", "rank_note": "순위 해석"})
+            
+        show["신뢰도"] = filtered_T["pred_sd"].apply(U.label_for)
+        
         st.dataframe(show[["이온화(%)", "헬퍼(%)", "콜레스테롤(%)", "PEG(%)",
-                           "예측 EE(%)", "±불확실성", "기준 대비", "순위 해석"]],
+                           "예측 EE(%)", "±불확실성", "신뢰도", "기준 대비", "순위 해석"]],
                      hide_index=True)
 
         # 신뢰할 수 있는 유일한 결론을 명시적으로 보여줍니다
         st.info(
             f"**실제로 읽어야 할 결론: PEG 비율입니다.** 상위 후보의 PEG "
-            f"중앙값은 {T.peg.median():.2f}% 입니다. 네 성분 중 PEG 만 "
+            f"중앙값은 {filtered_T.peg.median():.2f}% 입니다. 네 성분 중 PEG 만 "
             f"음성대조군 대비 뚜렷한 신호(2.7배)를 보였고, 실측 데이터에서도 "
             f"PEG–EE 상관이 rho=-0.35 (p=7e-17) 로 확인됩니다. "
             f"나머지 세 성분의 '최적값'은 데이터가 뒷받침하지 않습니다.")
 
         st.download_button("후보 조성 CSV 내려받기",
-                           T.to_csv(index=False).encode("utf-8-sig"),
+                           filtered_T.to_csv(index=False).encode("utf-8-sig"),
                            "lnp_optimize_candidates.csv", "text/csv")
 
         st.markdown("---")
@@ -145,6 +159,7 @@ def tab_whatif(st, df, model, v3_module):
         c1, c2, c3 = st.columns(3)
         c1.metric("문헌 실측 EE",
                   "없음" if r["measured_ee"] is None else f"{r['measured_ee']:.1f} %")
+        
         c2.metric("변경 전 예측", f"{r['pred_before']:.1f} %")
         c3.metric("변경 후 예측", f"{r['pred_after']:.1f} %",
                   delta=f"{r['delta']:+.1f} %p")
@@ -152,6 +167,11 @@ def tab_whatif(st, df, model, v3_module):
         st.markdown(f"- 조성: `{r['ratio_before']}` → `{r['ratio_after']}`")
         st.markdown(f"- 예측 변화량 **{r['delta']:+.1f} %p**, "
                     f"불확실성 ±{r['delta_sd']:.1f} %p")
+                    
+        # 💡 [핵심 패치] 신뢰도 평가 및 경고 출력
+        trust_label = U.label_for(r['delta_sd'])
+        if trust_label == "매우 낮음":
+             st.error("🚨 낯선 처방입니다! 트리 간 예측 편차가 너무 커서 신뢰도가 매우 낮습니다. 실험 결과가 크게 다를 수 있으니 참고하지 마십시오.")
 
         if r["significant"]:
             st.success(
