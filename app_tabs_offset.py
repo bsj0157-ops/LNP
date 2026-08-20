@@ -4,6 +4,7 @@
 기존 `app_tabs_optimize.tab_optimize` / `tab_whatif` / `app_tab_peg.tab_peg` 를
 그대로 두고, 예측 절대값에만 영점을 더해 표시합니다. 원 모듈을 고치지 않으므로
 영점 없이 쓰던 동작은 그대로 유지됩니다.
+동시에 lnp_uncertainty.py 를 통해 불확실성이 '매우 낮음'인 예측을 제어합니다.
 
 app.py 교체 방법
 ----------------
@@ -27,6 +28,7 @@ import numpy as np
 import pandas as pd
 
 import lnp_offset_bus as OB
+import lnp_uncertainty as U  # 💡 [추가] 불확실성 모듈 임포트
 
 
 def tab_optimize_anchored(st, df, model, v3_module, O):
@@ -62,6 +64,17 @@ def tab_optimize_anchored(st, df, model, v3_module, O):
         st.error("조성을 읽을 수 없습니다.")
         return
 
+    # 💡 [불확실성 패치] 신뢰도가 '매우 낮음'인 엉터리 레시피 걸러내기
+    trust_mask = T["pred_sd"].apply(lambda s: U.label_for(s) != "매우 낮음")
+    n_filtered = len(T) - trust_mask.sum()
+    T = T[trust_mask].copy()
+
+    if n_filtered > 0:
+        st.warning(f"🚨 예측 신뢰도가 '매우 낮음'인 불안정한 레시피 {n_filtered}개를 상위 목록에서 제거했습니다.")
+        if T.empty:
+            st.error("신뢰할 수 있는 예측 결과가 없습니다. 기준 처방이나 탐색 범위를 조정해 보세요.")
+            return
+
     n_tied = T.attrs.get("n_tied", 0)
     n_tot = T.attrs.get("n_grid_total", 0)
     span = T.attrs.get("grid_span", 0)
@@ -88,10 +101,14 @@ def tab_optimize_anchored(st, df, model, v3_module, O):
         "peg": "PEG(%)", "pred_ee": "예측 EE(%)", "pred_sd": "±불확실성",
         "delta_vs_template": "기준 대비", "rank_note": "순위 해석",
         "pred_ee_lab": "보정 전"})
+        
+    # 💡 [불확실성 패치] 화면 표에 '신뢰도' 열 추가
+    show["신뢰도"] = T["pred_sd"].apply(U.label_for)
+    
     cols = ["이온화(%)", "헬퍼(%)", "콜레스테롤(%)", "PEG(%)", "예측 EE(%)"]
     if off:
         cols.append("보정 전")
-    cols += ["±불확실성", "기준 대비", "순위 해석"]
+    cols += ["±불확실성", "신뢰도", "기준 대비", "순위 해석"]
     st.dataframe(show[cols], hide_index=True)
 
     st.info(
@@ -154,6 +171,12 @@ def tab_whatif_anchored(st, df, model, v3_module, O):
     st.markdown(f"- 조성: `{r['ratio_before']}` → `{r['ratio_after']}`")
     st.markdown(f"- 영점 없는 예측 변화량 **{r['delta']:+.1f} %p**, "
                 f"불확실성 ±{r['delta_sd']:.1f} %p")
+                
+    # 💡 [불확실성 패치] 낯선 처방에 대한 거짓말 탐지기 경고
+    trust_label = U.label_for(r['delta_sd'])
+    if trust_label == "매우 낮음":
+        st.error("🚨 **낯선 처방입니다!** 트리 간 예측 편차가 너무 커서 신뢰도가 매우 낮습니다. 실험 결과가 크게 다를 수 있으니 참고하지 마십시오.")
+
     if off:
         st.caption(
             f"영점 {off:+.1f} %p 를 상한 여유에 비례해 적용했습니다 "
@@ -194,6 +217,6 @@ def tab_peg_anchored(st, df, peg_module):
         if off:
             st.warning(
                 "PEG 모듈이 아직 영점 인자를 받지 않습니다 — 아래 곡선은 "
-                f"문헌 평균 기준입니다. 여러분 랩 기준으로 읽으려면 표시된 "
+                f"문헌 평균 기준입니다. 여러분 랩 기준으로 읽려면 표시된 "
                 f"값에 {off:+.1f} %p 를 더하십시오 (100% 상한 유의).")
         return peg_module.tab_peg(st, df)
