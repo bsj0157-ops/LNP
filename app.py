@@ -46,8 +46,10 @@ import lnp_anchor2 as A2
 import app_tab_anchor2 as T2
 import app_tabs_offset as TO
 
-# 💡 실시간 정확도 노트 모듈 임포트
+# 💡 실시간 정확도 노트 및 가벼운 모델, 불확실성 모듈 임포트
 import lnp_app_livenote as LN
+import lnp_features_lean as FL
+import lnp_uncertainty as U
 
 try:
     import lnp_pdf as LP
@@ -110,7 +112,8 @@ cached = C.install(st, F2, v3, P)
 work_df, work_info = cached["working_df"](st.session_state.df)
 oof = cached["oof"](work_df)
 
-cached_model = F2.make_cached_base_model(st, v3)
+# 💡 [패치] 불필요한 SMILES 기술자를 빼서 정확도와 속도를 높인 Lean Model로 교체
+cached_model = FL.make_cached_lean_model(st, v3)
 
 # --------------------------------------------------------------------------
 # 사이드바 — 현황
@@ -336,25 +339,46 @@ with tab_data:
     else:
         ed = st.data_editor(st.session_state.df, num_rows="dynamic", use_container_width=True, key="main_edit", height=380)
         
+        # 💡 [패치] 편집 내용 저장 시에도 행 축소 경고를 위한 안전 확인 프로세스 추가
         b1, b2, b3 = st.columns(3)
-        if b1.button("편집 내용 저장", type="primary"):
+        if b1.button("편집 내용 적용 심사", type="primary"):
             if "lipid_molar_ratio" in ed.columns:
                 valid_ed = ed.dropna(subset=["lipid_molar_ratio"])
                 valid_ed = valid_ed[valid_ed["lipid_molar_ratio"].astype(str).str.strip() != ""]
             else:
                 valid_ed = ed
             
-            # 교체 전 검증 및 안전 안내
             res = GD.screen_new_rows(valid_ed, _empty(), reduce_fn=AH.reduce_to_four)
+            
+            st.session_state["temp_edited_res"] = res
+            st.rerun()
+            
+        if "temp_edited_res" in st.session_state:
+            res = st.session_state["temp_edited_res"]
+            
             if len(res["rejected"]):
                 st.warning(f"{len(res['rejected'])}개의 불량 행이 감지되어 제거되었습니다.")
+            
             if len(res["accepted"]) < len(st.session_state.df):
-                st.info(f"중복 제거 등으로 인해 원본 {len(st.session_state.df)}행에서 {len(res['accepted'])}행으로 반영됩니다.")
+                st.warning(f"⚠️ 원본 {len(st.session_state.df)}행에서 {len(res['accepted'])}행으로 크게 줄어듭니다! (중복 제거 등 원인)")
                 
-            st.session_state.df = res["accepted"]
-            save_disk()
-            st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
-            st.rerun()
+                if st.checkbox("이대로 덮어쓰기에 동의합니다."):
+                    if st.button("확정 및 저장"):
+                        st.session_state.df = res["accepted"]
+                        save_disk()
+                        del st.session_state["temp_edited_res"]
+                        st.success("✅ 편집 내용이 안전하게 덮어씌워졌습니다.")
+                        st.rerun()
+                else:
+                    if st.button("취소 및 초기화"):
+                        del st.session_state["temp_edited_res"]
+                        st.rerun()
+            else:
+                st.session_state.df = res["accepted"]
+                save_disk()
+                del st.session_state["temp_edited_res"]
+                st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
+                st.rerun()
 
 # ==========================================================================
 # 탭 4 — 모델 실행 및 앵커링
@@ -377,7 +401,7 @@ with tab_model:
         from sklearn.preprocessing import OneHotEncoder, StandardScaler
         from scipy.stats import spearmanr
 
-        # 💡 반복 호출로 인한 병목 제거: cached matrix 사용
+        # 💡 [패치] 반복 계산 병목 제거: cached matrix 사용
         X, y, groups, num_cols, cat_cols = cached["matrix"](work_df)
 
         pre = ColumnTransformer([
