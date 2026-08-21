@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 import lnp_offset_bus as OB
-import lnp_model_v5 as M5  # 💡 [에러 해결] V4 -> V5로 임포트 수정 완료!
+import lnp_model_v6 as M6  # 💡 [에러 해결] V5 -> V6 모델 임포트로 완벽히 교체!
 
 
 def tab_optimize_anchored(st, df, model, v3_module, O):
@@ -84,8 +84,8 @@ def tab_optimize_anchored(st, df, model, v3_module, O):
             f"최적화에서 단순 덧셈은 상위 후보를 모두 100%로 만들어 구별할 수 "
             f"없게 만듭니다.")
 
-    # 💡 [V5 패치] M5의 band_of 사용
-    T["신뢰도"] = T["pred_sd"].apply(M5.band_of)
+    # 💡 [V6 패치] M6.band_of 함수로 연결
+    T["신뢰도"] = T["pred_sd"].apply(M6.band_of)
     
     # 만약 '매우 낮음' 처방이 섞여 있다면 사용자에게 직접 경고
     n_untrusted = (T["신뢰도"] == "매우 낮음").sum()
@@ -160,8 +160,8 @@ def tab_whatif_anchored(st, df, model, v3_module, O):
 
     st.markdown(f"- 조성: `{r['ratio_before']}` → `{r['ratio_after']}`")
     
-    # 💡 [V5 패치] M5.band_of 사용
-    trust_label = M5.band_of(r['delta_sd'])
+    # 💡 [V6 패치] M6.band_of 사용
+    trust_label = M6.band_of(r['delta_sd'])
     st.markdown(f"- 영점 없는 예측 변화량 **{r['delta']:+.1f} %p**, "
                 f"불확실성 ±{r['delta_sd']:.1f} %p (신뢰도: **{trust_label}**)")
                 
