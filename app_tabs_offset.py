@@ -4,7 +4,6 @@
 기존 `app_tabs_optimize.tab_optimize` / `tab_whatif` / `app_tab_peg.tab_peg` 를
 그대로 두고, 예측 절대값에만 영점을 더해 표시합니다. 원 모듈을 고치지 않으므로
 영점 없이 쓰던 동작은 그대로 유지됩니다.
-동시에 lnp_uncertainty.py 를 통해 불확실성이 '매우 낮음'인 예측을 제어합니다.
 
 app.py 교체 방법
 ----------------
@@ -28,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 import lnp_offset_bus as OB
-import lnp_uncertainty as U  # 💡 [추가] 불확실성 모듈 임포트
+import lnp_model_v4 as M4  # 💡 V4 모델 불확실성 밴드 적용용 임포트
 
 
 def tab_optimize_anchored(st, df, model, v3_module, O):
@@ -64,17 +63,6 @@ def tab_optimize_anchored(st, df, model, v3_module, O):
         st.error("조성을 읽을 수 없습니다.")
         return
 
-    # 💡 [불확실성 패치] 신뢰도가 '매우 낮음'인 엉터리 레시피 걸러내기
-    trust_mask = T["pred_sd"].apply(lambda s: U.label_for(s) != "매우 낮음")
-    n_filtered = len(T) - trust_mask.sum()
-    T = T[trust_mask].copy()
-
-    if n_filtered > 0:
-        st.warning(f"🚨 예측 신뢰도가 '매우 낮음'인 불안정한 레시피 {n_filtered}개를 상위 목록에서 제거했습니다.")
-        if T.empty:
-            st.error("신뢰할 수 있는 예측 결과가 없습니다. 기준 처방이나 탐색 범위를 조정해 보세요.")
-            return
-
     n_tied = T.attrs.get("n_tied", 0)
     n_tot = T.attrs.get("n_grid_total", 0)
     span = T.attrs.get("grid_span", 0)
@@ -96,19 +84,24 @@ def tab_optimize_anchored(st, df, model, v3_module, O):
             f"최적화에서 단순 덧셈은 상위 후보를 모두 100%로 만들어 구별할 수 "
             f"없게 만듭니다.")
 
+    # 💡 [V4 불확실성 패치] 예측 표준편차를 기반으로 신뢰도 라벨 계산
+    T["신뢰도"] = T["pred_sd"].apply(M4.band_of)
+    
+    # 만약 '매우 낮음' 처방이 섞여 있다면 사용자에게 직접 경고
+    n_untrusted = (T["신뢰도"] == "매우 낮음").sum()
+    if n_untrusted > 0:
+        st.error(f"🚨 주의: 상위 후보 중 {n_untrusted}개는 예측 신뢰도가 '매우 낮음'입니다. 표에서 신뢰도를 확인하시고 해당 레시피는 피하십시오.")
+
     show = T.rename(columns={
         "ionizable": "이온화(%)", "helper": "헬퍼(%)", "chol": "콜레스테롤(%)",
         "peg": "PEG(%)", "pred_ee": "예측 EE(%)", "pred_sd": "±불확실성",
         "delta_vs_template": "기준 대비", "rank_note": "순위 해석",
         "pred_ee_lab": "보정 전"})
         
-    # 💡 [불확실성 패치] 화면 표에 '신뢰도' 열 추가
-    show["신뢰도"] = T["pred_sd"].apply(U.label_for)
-    
     cols = ["이온화(%)", "헬퍼(%)", "콜레스테롤(%)", "PEG(%)", "예측 EE(%)"]
     if off:
         cols.append("보정 전")
-    cols += ["±불확실성", "신뢰도", "기준 대비", "순위 해석"]
+    cols += ["±불확실성", "신뢰도", "기준 대비", "순위 해석"]  # 신뢰도 열 추가
     st.dataframe(show[cols], hide_index=True)
 
     st.info(
@@ -152,15 +145,12 @@ def tab_whatif_anchored(st, df, model, v3_module, O):
         st.error(f"비율을 읽을 수 없습니다: {e}")
         return
 
-    # 전·후를 따로 자르면 둘 다 100 이 되어 Δ 가 사라집니다(측정: 영점
-    # +11.9 %p 에서 93.1→84.8 이 100→100 이 됐습니다). 두 값을 **함께**
-    # 여유 비례로 보정해 Δ 를 보존합니다.
     ref = OB.reference_prediction(st)
     both, eff = OB.apply_offset_headroom(
         [r["pred_before"], r["pred_after"]], off, ref=ref)
     pb, pa = float(both.iloc[0]), float(both.iloc[1])
     delta_adj = pa - pb
-    cb = ca = 0
+    
     c1, c2, c3 = st.columns(3)
     c1.metric("문헌 실측 EE",
               "없음" if r["measured_ee"] is None else f"{r['measured_ee']:.1f} %")
@@ -169,13 +159,14 @@ def tab_whatif_anchored(st, df, model, v3_module, O):
               delta=f"{(delta_adj if off else r['delta']):+.1f} %p")
 
     st.markdown(f"- 조성: `{r['ratio_before']}` → `{r['ratio_after']}`")
+    
+    # 💡 [V4 불확실성 패치] 낯선 처방에 대한 강력한 시각적 경고
+    trust_label = M4.band_of(r['delta_sd'])
     st.markdown(f"- 영점 없는 예측 변화량 **{r['delta']:+.1f} %p**, "
-                f"불확실성 ±{r['delta_sd']:.1f} %p")
+                f"불확실성 ±{r['delta_sd']:.1f} %p (신뢰도: **{trust_label}**)")
                 
-    # 💡 [불확실성 패치] 낯선 처방에 대한 거짓말 탐지기 경고
-    trust_label = U.label_for(r['delta_sd'])
     if trust_label == "매우 낮음":
-        st.error("🚨 **낯선 처방입니다!** 트리 간 예측 편차가 너무 커서 신뢰도가 매우 낮습니다. 실험 결과가 크게 다를 수 있으니 참고하지 마십시오.")
+        st.error(f"🚨 **낯선 처방입니다!** 트리 간 예측 편차가 너무 커 예측 신뢰도가 매우 낮습니다. 실험 결과가 전혀 다를 수 있으니 가급적 피하십시오.")
 
     if off:
         st.caption(
@@ -209,14 +200,12 @@ def tab_peg_anchored(st, df, peg_module):
         st.caption(
             f"아래 예측 절대값에 영점 {off:+.1f} %p 가 적용됩니다. "
             f"**PEG 변화에 따른 곡선 모양과 기울기는 바뀌지 않습니다.**")
-    # 원 모듈은 내부에서 직접 그리므로, 영점을 세션에 남겨 두고 그대로 호출합니다.
-    # peg_module 이 offset 인자를 받도록 확장되면 그 인자로 넘기십시오.
     try:
         return peg_module.tab_peg(st, df, offset=off)
     except TypeError:
         if off:
             st.warning(
                 "PEG 모듈이 아직 영점 인자를 받지 않습니다 — 아래 곡선은 "
-                f"문헌 평균 기준입니다. 여러분 랩 기준으로 읽려면 표시된 "
+                f"문헌 평균 기준입니다. 여러분 랩 기준으로 읽으려면 표시된 "
                 f"값에 {off:+.1f} %p 를 더하십시오 (100% 상한 유의).")
         return peg_module.tab_peg(st, df)
