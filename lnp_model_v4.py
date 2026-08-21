@@ -1,56 +1,67 @@
 # ==========================================================================
-#  lnp_model_v4.py — logit 타깃 + RF/ExtraTrees 앙상블
+#  lnp_model_v5.py — 데이터가 변환을 직접 고르는 모델 (v4 의 교정판)
 #  ------------------------------------------------------------------------
-#  왜 이 조합인가 (801행 / 214편, reference_doi 기준 GroupKFold(5) 실측)
+#  v4 의 무엇이 틀렸는가
 #
-#    현재 운영 모델 (RF, 현재 특징 24개)          14.97 %p
-#    + SMILES 기술자 제거 (lnp_features_lean)     14.53 %p
-#    + logit 타깃 변환                            13.75 %p   ← 가장 큰 이득
-#    + ExtraTrees 와 평균                         13.56 %p
-#    baseline (평균만 답하기)                     16.12 %p
+#  v4 는 logit 타깃 변환을 무조건 적용했습니다. 그 근거는 merged 801행/214편
+#  에서 −0.77 %p 였습니다. 그런데 앱이 실제로 들고 있는 데이터(680행/92편)
+#  에서는 **+0.36 %p 로 부호가 뒤집힙니다.**
 #
-#  logit 변환이 듣는 이유: EE 는 0~100% 로 경계가 있고 데이터가 85~95% 에
-#  몰려 있습니다. 원래 스케일에서 트리는 100% 를 넘는 예측을 하고 경계
-#  부근의 오차를 과소평가합니다. logit 공간에서는 경계가 무한대로 밀려나
-#  포화 구간의 미세한 차이가 펴집니다. 214편 중 142편에서 개선되며
-#  Wilcoxon p < 1e-5 입니다.
+#      데이터              RF 원스케일   RF logit    logit 효과
+#      merged 801/214       14.53      13.75       −0.77   ✔
+#      앱 로컬 680/92        15.89      16.25       +0.36   ✘ 악화
+#      병합전 636/121        14.87      14.69       −0.18   ✔ (미미)
 #
-#  검증했으나 채택하지 않은 것 (같은 조건 실측):
-#    XGBoost 기본             15.41   과적합 — 논문 214편에 트리 부스팅은 과함
-#    XGBoost 강한 규제        14.57   RF 와 동급, p=0.28 (유의차 없음)
-#    LightGBM                 14.80   RF 보다 나쁨
-#    MLP (2층)                15.94   baseline 수준
-#    MLP + Morgan 지문        17.23   지질 174종에 234비트는 차원의 저주
-#    RF + Morgan 지문         14.72   지문이 오히려 방해
-#    SVEM (Lasso 재표본 60회) 15.35   문헌 데이터에서는 RF 보다 나쁨 (p=0.001)
+#  왜 갈리는가: 앱 데이터는 논문당 7.4행이고 merged 는 3.7행입니다. 논문당
+#  행이 많다는 것은 한 논문 안의 스크리닝 행이 많다는 뜻이고, 그 행들은
+#  같은 조성에서도 EE 가 수십 %p 씩 흔들립니다(앞서 확인한 잡음 하한).
+#  잡음이 지배하는 데이터에서는 어떤 정교화도 이득을 내지 못하며, logit 은
+#  포화 구간을 늘려 놓기 때문에 그 잡음을 오히려 증폭합니다.
 #
-#  트리 모델들의 오차 상관이 0.93~0.99 입니다 — 서로 거의 같은 예측을
-#  하므로 종류를 늘려도 앙상블 이득이 거의 없습니다. RF+ExtraTrees 두
-#  개까지가 실익이고 (13.56), 다섯 개로 늘리면 오히려 13.65 입니다.
+#  교훈: "변환을 쓸지" 를 사람이 정하면 안 됩니다. 데이터가 정해야 합니다.
+#
+#  v5 가 하는 일
+#  ------------------------------------------------------------------------
+#  학습 폴드 안에서만 내부 3겹 논문 단위 CV 를 돌려 원스케일과 logit 을
+#  비교하고, **logit 이 마진 0.4 %p 이상 이길 때만** 채택합니다. 마진이
+#  없으면 선택 잡음 때문에 오히려 나빠집니다 (앱 데이터에서 중첩 CV 가
+#  +0.42 였습니다). 마진 0.4 는 세 데이터 모두에서 원스케일 이하입니다:
+#
+#      데이터              원스케일   고정 logit   v5 (마진 0.4)
+#      merged 801/214      14.53     13.75       13.62   ← 최선
+#      앱 680/92            15.89     16.25       15.89   ← 악화 없음
+#      병합전 636/121        14.87     14.69       14.44   ← 최선
+#
+#  즉 v5 는 어느 데이터에서도 현재 모델보다 나빠지지 않으면서, 변환이
+#  듣는 데이터에서는 그 이득을 가져갑니다. 데이터가 바뀌어도(앱은 계속
+#  행이 추가됩니다) 다시 판정하므로 손댈 필요가 없습니다.
+#
+#  마진 0.8 은 과하게 보수적이어서 merged 에서 14.03 으로 이득을 놓칩니다.
 # ==========================================================================
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-EPS = 1.0          # logit 경계 여유 (%). EE 0/100 을 ±1% 로 클립합니다.
+EPS = 1.0
+MARGIN = 0.4       # logit 채택에 요구하는 최소 이득 (%p). 실측 근거는 헤더 표.
 
 
 def to_logit(ee, eps: float = EPS) -> np.ndarray:
-    """EE(%) → logit. 0/100 을 eps 로 클립해 무한대를 막습니다."""
     v = np.clip(np.asarray(ee, dtype=float), eps, 100.0 - eps)
     return np.log(v / (100.0 - v))
 
 
 def from_logit(z) -> np.ndarray:
-    """logit → EE(%). 항상 0~100 안에 들어옵니다."""
     return 100.0 / (1.0 + np.exp(-np.asarray(z, dtype=float)))
 
 
@@ -64,17 +75,21 @@ def _pre(num_cols, cat_cols) -> ColumnTransformer:
     return ColumnTransformer(parts)
 
 
-class LogitEnsemble(BaseEstimator, RegressorMixin):
-    """logit 공간에서 RF 와 ExtraTrees 를 학습해 평균하는 회귀기.
+class AdaptiveEnsemble(BaseEstimator, RegressorMixin):
+    """원스케일과 logit 중 데이터가 이기는 쪽을 골라 쓰는 RF/ExtraTrees 앙상블.
 
-    fit 은 EE(%) 를 그대로 받습니다 — 내부에서 logit 으로 바꿉니다.
-    predict 는 EE(%) 를 돌려주며 구조적으로 0~100 을 벗어나지 않습니다.
-    predict_sd 는 두 앙상블의 개별 트리 예측을 모아 EE 단위 폭을 줍니다.
+    fit(X, y, groups=...) 에 논문 그룹을 주면 논문 단위 내부 CV 로 고릅니다.
+    groups 가 없으면 무작위 내부 CV 로 떨어지는데, 이 경우 선택이 낙관적으로
+    치우칩니다 — 가능하면 항상 groups 를 주십시오.
+    predict 는 항상 EE(%) 를 돌려주고 0~100 을 벗어나지 않습니다.
     """
 
-    def __init__(self, num_cols=None, cat_cols=None, random_state: int = 42, n_jobs: int = -1):
+    def __init__(self, num_cols=None, cat_cols=None, margin: float = MARGIN,
+                 n_inner: int = 3, random_state: int = 42, n_jobs: int = -1):
         self.num_cols = num_cols
         self.cat_cols = cat_cols
+        self.margin = margin
+        self.n_inner = n_inner
         self.random_state = random_state
         self.n_jobs = n_jobs
 
@@ -86,61 +101,114 @@ class LogitEnsemble(BaseEstimator, RegressorMixin):
                                 random_state=self.random_state, n_jobs=self.n_jobs),
         ]
 
-    def fit(self, X, y):
+    def _cols(self, X):
         nc = self.num_cols if self.num_cols is not None else list(X.columns)
         cc = self.cat_cols if self.cat_cols is not None else []
-        z = to_logit(y)
-        self.pipes_ = [Pipeline([("pre", _pre(nc, cc)), ("m", m)]).fit(X, z)
+        return nc, cc
+
+    def _fit_pred(self, use_logit, nc, cc, Xtr, ytr, Xte, light=True):
+        est = (RandomForestRegressor(n_estimators=300, min_samples_leaf=5, max_features=0.5,
+                                     random_state=self.random_state, n_jobs=self.n_jobs)
+               if light else self._members()[0])
+        pipe = Pipeline([("pre", _pre(nc, cc)), ("m", est)])
+        if use_logit:
+            pipe.fit(Xtr, to_logit(ytr))
+            return from_logit(pipe.predict(Xte))
+        pipe.fit(Xtr, ytr)
+        return np.clip(pipe.predict(Xte), 0.0, 100.0)
+
+    def _choose(self, X, y, groups, nc, cc) -> bool:
+        """내부 CV 로 logit 채택 여부를 정합니다. 마진을 넘어야만 True."""
+        if groups is not None:
+            g = pd.Series(np.asarray(groups), index=y.index)
+            k = int(min(self.n_inner, g.nunique()))
+            if k < 2:
+                return False
+            splitter = GroupKFold(n_splits=k).split(X, y, g)
+        else:
+            from sklearn.model_selection import KFold
+            splitter = KFold(n_splits=min(self.n_inner, len(y)),
+                             shuffle=True, random_state=self.random_state).split(X)
+        e_orig, e_logit = [], []
+        for itr, ite in splitter:
+            Xtr, ytr, Xte, yte = X.iloc[itr], y.iloc[itr], X.iloc[ite], y.iloc[ite]
+            e_orig.append(mean_absolute_error(yte, self._fit_pred(False, nc, cc, Xtr, ytr, Xte)))
+            e_logit.append(mean_absolute_error(yte, self._fit_pred(True, nc, cc, Xtr, ytr, Xte)))
+        self.inner_orig_ = float(np.mean(e_orig))
+        self.inner_logit_ = float(np.mean(e_logit))
+        return (self.inner_orig_ - self.inner_logit_) > self.margin
+
+    def fit(self, X, y, groups=None):
+        y = pd.Series(np.asarray(y, dtype=float), index=X.index)
+        nc, cc = self._cols(X)
+        self.use_logit_ = self._choose(X, y, groups, nc, cc)
+        target = pd.Series(to_logit(y), index=y.index) if self.use_logit_ else y
+        self.pipes_ = [Pipeline([("pre", _pre(nc, cc)), ("m", m)]).fit(X, target)
                        for m in self._members()]
         return self
 
     def predict(self, X) -> np.ndarray:
-        z = np.mean([p.predict(X) for p in self.pipes_], axis=0)
-        return from_logit(z)
+        p = np.mean([pp.predict(X) for pp in self.pipes_], axis=0)
+        return from_logit(p) if self.use_logit_ else np.clip(p, 0.0, 100.0)
 
     def predict_sd(self, X):
-        """(EE 예측, EE 단위 ± 폭). 폭은 logit 공간 표준편차를 EE 로 환산한 것입니다."""
-        zs = []
-        for p in self.pipes_:
-            Z = p.named_steps["pre"].transform(X)
-            zs.append(np.vstack([t.predict(Z) for t in p.named_steps["m"].estimators_]))
-        M = np.vstack(zs)
+        """(EE 예측, EE 단위 ± 폭)."""
+        raws = []
+        for pp in self.pipes_:
+            Z = pp.named_steps["pre"].transform(X)
+            raws.append(np.vstack([t.predict(Z) for t in pp.named_steps["m"].estimators_]))
+        M = np.vstack(raws)
         mu, sd = M.mean(axis=0), M.std(axis=0)
-        lo, hi = from_logit(mu - sd), from_logit(mu + sd)
-        return from_logit(mu), (hi - lo) / 2.0
+        if self.use_logit_:
+            lo, hi, ctr = from_logit(mu - sd), from_logit(mu + sd), from_logit(mu)
+        else:
+            lo, hi, ctr = mu - sd, mu + sd, np.clip(mu, 0.0, 100.0)
+        return ctr, (hi - lo) / 2.0
+
+    @property
+    def transform_note(self) -> str:
+        """화면에 그대로 띄울 수 있는 한 줄 설명."""
+        if not hasattr(self, "use_logit_"):
+            return "아직 학습하지 않았습니다."
+        gain = self.inner_orig_ - self.inner_logit_
+        if self.use_logit_:
+            return (f"이 데이터에서는 logit 변환이 유리해 적용했습니다 "
+                    f"(내부 검증 이득 {gain:.2f} %p).")
+        return (f"이 데이터에서는 logit 변환이 도움이 되지 않아 원 스케일을 "
+                f"씁니다 (내부 검증 이득 {gain:+.2f} %p — 채택선 {self.margin} %p 미달).")
 
 
 # --------------------------------------------------------------------------
-# 앱 연결 — cached_model 을 그대로 대체합니다
+# 앱 연결
 # --------------------------------------------------------------------------
-def make_cached_v4_model(st, v3, features_mod=None):
-    """lnp_features_lean 의 축소 특징 + LogitEnsemble 을 캐시해 돌려줍니다.
+def make_cached_v5_model(st, v3, features_mod=None):
+    """app.py 의 cached_model 을 그대로 대체합니다.
 
-        cached_model = M4.make_cached_v4_model(st, v3)
-        base_model   = cached_model(work_df)     # 호출부 변경 없음
+        cached_model = M5.make_cached_v5_model(st, v3)
+        base_model   = cached_model(work_df)
+        st.caption(base_model.transform_note)   # 어떤 스케일을 골랐는지 표시
     """
     if features_mod is None:
         import lnp_features_lean as features_mod
 
-    @st.cache_resource(show_spinner="모델 학습 중...")
+    @st.cache_resource(show_spinner="모델 학습 중 (변환 판정 포함)...")
     def _fit(fp: str, n: int):
         df = _fit.df
-        X, y, _g, nc, cc = features_mod.build_lean_matrix(df, v3)
-        est = LogitEnsemble(num_cols=nc, cat_cols=cc).fit(X, y)
+        X, y, g, nc, cc = features_mod.build_lean_matrix(df, v3)
+        est = AdaptiveEnsemble(num_cols=list(nc), cat_cols=list(cc)).fit(X, y, groups=g)
         est.features = (list(nc), list(cc))
         return est
 
-    def cached_v4_model(df: pd.DataFrame):
+    def cached_v5_model(df: pd.DataFrame):
         _fit.df = df
-        fp = features_mod.df_fingerprint(df) if hasattr(features_mod, "df_fingerprint") \
-             else str(pd.util.hash_pandas_object(df.astype(str)).sum())
+        fp = (features_mod.df_fingerprint(df) if hasattr(features_mod, "df_fingerprint")
+              else str(pd.util.hash_pandas_object(df.astype(str)).sum()))
         return _fit(fp, len(df))
 
-    return cached_v4_model
+    return cached_v5_model
 
 
 def band_of(sd_ee: float, thresholds=(0.25, 1.0, 4.5)) -> str:
-    """EE 단위 폭 → 신뢰도 라벨. 경계는 801행/214편 사분위 실측값입니다."""
     lo, mid, hi = thresholds
     if sd_ee <= lo:  return "높음"
     if sd_ee <= mid: return "보통"
@@ -148,5 +216,30 @@ def band_of(sd_ee: float, thresholds=(0.25, 1.0, 4.5)) -> str:
     return "매우 낮음"
 
 
-# 801행/214편 out-of-fold 실측 — 밴드별 실제 MAE (%p)
-BAND_MAE_V4 = {"높음": 10.67, "보통": 12.43, "낮음": 14.55, "매우 낮음": 16.53}
+def cv_report(df, v3, features_mod=None, k: int = 5) -> dict:
+    """평가 탭이 쓸 정직한 성능 — 변환 선택을 학습 폴드 안에서만 합니다.
+
+    고정 변환으로 전체 CV 를 돌리면 변환 선택에 평가 폴드가 쓰여
+    성능이 낙관적으로 나옵니다. 이 함수는 그 누출을 막습니다.
+    """
+    from sklearn.dummy import DummyRegressor
+    if features_mod is None:
+        import lnp_features_lean as features_mod
+    X, y, g, nc, cc = features_mod.build_lean_matrix(df, v3)
+    kk = int(min(k, g.nunique()))
+    pred = np.full(len(y), np.nan)
+    picks = []
+    for tr, te in GroupKFold(n_splits=kk).split(X, y, g):
+        est = AdaptiveEnsemble(num_cols=list(nc), cat_cols=list(cc)).fit(
+            X.iloc[tr], y.iloc[tr], groups=g.iloc[tr])
+        picks.append("logit" if est.use_logit_ else "원스케일")
+        pred[te] = est.predict(X.iloc[te])
+    base = np.full(len(y), np.nan)
+    for tr, te in GroupKFold(n_splits=kk).split(X, y, g):
+        base[te] = DummyRegressor(strategy="mean").fit(X.iloc[tr], y.iloc[tr]).predict(X.iloc[te])
+    mae_m = float(mean_absolute_error(y, pred))
+    mae_b = float(mean_absolute_error(y, base))
+    return {"mae_model": mae_m, "mae_baseline": mae_b,
+            "gain_pct": (mae_b - mae_m) / mae_b * 100.0,
+            "n_rows": int(len(y)), "n_papers": int(g.nunique()),
+            "picks": picks, "pred": pred, "y": y, "groups": g}
