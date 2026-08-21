@@ -113,7 +113,6 @@ cached = C.install(st, F2, v3, P)
 work_df, work_info = cached["working_df"](st.session_state.df)
 oof = cached["oof"](work_df)
 
-# 💡 [패치] V6 엔진 교체
 cached_model = M6.make_cached_v6_model(st, v3)
 
 # --------------------------------------------------------------------------
@@ -143,7 +142,6 @@ st.sidebar.caption(
     "서로 닮아 있습니다. 무작위로 나누면 성능이 부풀려지므로 논문 단위로 "
     "나눠야 하고, 그때 실질 표본 수는 행 수가 아니라 논문 수입니다.")
 
-# 💡 실시간 구간별 정확도로 사이드바 동적 반영
 st.sidebar.markdown(LN.accuracy_note(work_df, oof, base_note=F2.ACCURACY_NOTE))
 
 if len(st.session_state.df):
@@ -270,13 +268,15 @@ with tab_form:
             add_rows(new)
 
 # ==========================================================================
-# 탭 3 — 데이터 관리 (💡 검열 우회 다이렉트 덮어쓰기 로직 유지)
+# 탭 3 — 데이터 관리 (💡 엄격한 양식 검사 로직 적용 완료)
 # ==========================================================================
 with tab_data:
     st.header("데이터 관리")
     F2.show_data_consistency(st, work_df, st.session_state.df)
     
-    up2 = st.file_uploader("기존 CSV 불러오기 (표준 형식으로 자동 정렬 및 정제)", type=["csv"], key="csvup")
+    st.info("💡 CSV 업로드 시 데이터베이스 양식(컬럼명)과 완벽히 일치해야 덮어쓰기가 가능합니다. (좌측 사이드바의 '원본 전체 내려받기' 양식 참고)")
+    up2 = st.file_uploader("기존 CSV 불러오기 (표준 형식 엄격 검사)", type=["csv"], key="csvup")
+    
     if up2 is not None:
         raw = up2.read()
         d_raw = None
@@ -287,40 +287,53 @@ with tab_data:
             except Exception as e:
                 parse_err = e
                 continue
+                
         if d_raw is None:
             st.error(f"CSV 파싱 에러 발생: {parse_err}")
         else:
-            d_clean = pd.DataFrame(columns=st.session_state.df.columns)
-            for col in st.session_state.df.columns:
-                d_clean[col] = d_raw[col] if col in d_raw.columns else np.nan
+            # 💡 [핵심 패치] 양식 엄격 검사 로직
+            expected_cols = list(st.session_state.df.columns)
+            missing_cols = [col for col in expected_cols if col not in d_raw.columns]
             
-            ee_col = "encapsulation_efficiency_percent_std_num"
-            d_clean[ee_col] = d_clean[ee_col].map(P.robust_ee)
-            
-            num_cols = ["np_ratio_std_num", "buffer_ph_std_num", "particle_size_nm_std_num", "pdi_std_num", "zeta_potential_mv_std_num"]
-            for col in num_cols:
-                if col in d_clean.columns: d_clean[col] = pd.to_numeric(d_clean[col], errors='coerce')
+            if missing_cols:
+                st.error("🚨 **양식 불일치 에러!** 업로드한 CSV 파일이 표준 양식과 맞지 않아 데이터를 덮어쓸 수 없습니다.")
+                st.warning(f"**누락된 필수 컬럼 ({len(missing_cols)}개):**\n" + ", ".join(missing_cols))
+                st.caption("해결 방법: 좌측 사이드바에서 '원본 전체 내려받기'를 클릭하여 최신 양식을 확인하신 후, 동일한 컬럼 구조로 맞추어 다시 업로드해 주세요.")
+            else:
+                # 양식이 완벽히 일치할 때만 정상 처리 진행
+                d_clean = pd.DataFrame(columns=expected_cols)
+                for col in expected_cols:
+                    d_clean[col] = d_raw[col]
+                
+                ee_col = "encapsulation_efficiency_percent_std_num"
+                d_clean[ee_col] = d_clean[ee_col].map(P.robust_ee)
+                
+                num_cols = ["np_ratio_std_num", "buffer_ph_std_num", "particle_size_nm_std_num", "pdi_std_num", "zeta_potential_mv_std_num"]
+                for col in num_cols:
+                    if col in d_clean.columns: d_clean[col] = pd.to_numeric(d_clean[col], errors='coerce')
 
-            st.write("---")
-            st.subheader("가져온 데이터 미리보기 (자동 정제됨)")
-            st.dataframe(d_clean.head(5))
-            
-            n_invalid = d_clean[ee_col].isna().sum()
-            if n_invalid > 0: st.warning(f"⚠️ 경고: {n_invalid}개 행은 EE 수치가 없어서 제외됩니다.")
+                st.write("---")
+                st.success("✅ CSV 양식 검사 통과! 데이터가 표준 양식과 완벽히 일치합니다.")
+                st.subheader("가져온 데이터 미리보기 (자동 정제됨)")
+                st.dataframe(d_clean.head(5))
                 
-            c1, c2 = st.columns(2)
-            if c1.button(f"정상 데이터 {len(d_clean) - n_invalid}행 추가하기"):
-                add_rows(d_clean.dropna(subset=[ee_col]))
-                
-            if c2.button(f"⚠️ 검열 우회: 이 {len(d_clean) - n_invalid}행으로 다이렉트 덮어쓰기", type="primary"):
-                valid_d = d_clean.dropna(subset=[ee_col])
-                if len(valid_d) == 0:
-                    st.error("데이터를 읽지 못했습니다! CSV 파일의 EE 컬럼명을 확인해 주세요.")
-                else:
-                    st.session_state.df = valid_d.copy().reset_index(drop=True)
-                    save_disk()
-                    st.success(f"✅ {len(valid_d)}행으로 데이터베이스가 완벽하게 강제 덮어쓰기 되었습니다.")
-                    st.rerun()
+                n_invalid = d_clean[ee_col].isna().sum()
+                if n_invalid > 0: st.warning(f"⚠️ 경고: {n_invalid}개 행은 EE 수치가 없어서 제외됩니다.")
+                    
+                c1, c2 = st.columns(2)
+                if c1.button(f"정상 데이터 {len(d_clean) - n_invalid}행 추가하기"):
+                    add_rows(d_clean.dropna(subset=[ee_col]))
+                    
+                # 안전하고 정직한 덮어쓰기 버튼으로 변경
+                if c2.button(f"🔄 기존 데이터를 이 {len(d_clean) - n_invalid}행으로 안전하게 교체", type="primary"):
+                    valid_d = d_clean.dropna(subset=[ee_col])
+                    if len(valid_d) == 0:
+                        st.error("유효한 데이터(EE 수치 포함)가 없어 교체할 수 없습니다.")
+                    else:
+                        st.session_state.df = valid_d.copy().reset_index(drop=True)
+                        save_disk()
+                        st.success(f"✅ {len(valid_d)}행으로 데이터베이스가 안전하게 교체되었습니다.")
+                        st.rerun()
 
     st.divider()
     st.subheader("📝 엑셀에서 바로 복사/붙여넣기")
@@ -337,7 +350,7 @@ with tab_data:
             st.rerun()
 
 # ==========================================================================
-# 탭 4 — 모델 실행 및 앵커링 (💡 V6 cv_report 적용)
+# 탭 4 — 모델 실행 및 앵커링 
 # ==========================================================================
 with tab_model:
     st.header("모델 실행")
@@ -350,7 +363,6 @@ with tab_model:
         from scipy.stats import spearmanr
         
         with st.spinner("중첩 CV 진행 중... (변환 강도 자동 선택)"):
-            # 💡 [V6 패치] M6.cv_report 호출
             rep = M6.cv_report(work_df, v3)
 
         c1, c2, c3 = st.columns(3)
@@ -364,7 +376,7 @@ with tab_model:
         st.write(f"**논문 간 분산 비중(ICC) = {icc:.2f}**")
 
         groups = rep["groups"]
-        pm = rep["pred"]  # 💡 V6 리포트 반환 키 ('pred')
+        pm = rep["pred"]
         y = rep["y"]
         
         rhos = [spearmanr(y.loc[idx], pd.Series(pm, index=y.index).loc[idx])[0] 
@@ -386,7 +398,7 @@ with tab_model:
 with tab_opt:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        st.caption(base_model.transform_note)  # 💡 V6 변환 스케일 선택 결과 출력
+        st.caption(base_model.transform_note)
         TO.tab_optimize_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
@@ -394,7 +406,7 @@ with tab_opt:
 with tab_what:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        st.caption(base_model.transform_note)  # 💡 V6 변환 스케일 선택 결과 출력
+        st.caption(base_model.transform_note)
         TO.tab_whatif_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
