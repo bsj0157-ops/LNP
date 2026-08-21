@@ -50,7 +50,7 @@ import app_tabs_offset as TO
 import lnp_app_livenote as LN
 import lnp_features_lean as FL
 import lnp_uncertainty as U
-import lnp_model_v5 as M5  # 💡 [패치] V5 자동 스케일 모델 임포트
+import lnp_model_v6 as M6  # 💡 [패치] V6 자동 스케일 모델 임포트
 
 try:
     import lnp_pdf as LP
@@ -113,8 +113,8 @@ cached = C.install(st, F2, v3, P)
 work_df, work_info = cached["working_df"](st.session_state.df)
 oof = cached["oof"](work_df)
 
-# 💡 [패치] 데이터 특성에 따라 스케일을 자동 결정하는 V5 모델로 교체
-cached_model = M5.make_cached_v5_model(st, v3)
+# 💡 [패치] V6 엔진 교체
+cached_model = M6.make_cached_v6_model(st, v3)
 
 # --------------------------------------------------------------------------
 # 사이드바 — 현황
@@ -270,13 +270,12 @@ with tab_form:
             add_rows(new)
 
 # ==========================================================================
-# 탭 3 — 데이터 관리
+# 탭 3 — 데이터 관리 (💡 검열 우회 다이렉트 덮어쓰기 로직 유지)
 # ==========================================================================
 with tab_data:
     st.header("데이터 관리")
-    
     F2.show_data_consistency(st, work_df, st.session_state.df)
-
+    
     up2 = st.file_uploader("기존 CSV 불러오기 (표준 형식으로 자동 정렬 및 정제)", type=["csv"], key="csvup")
     if up2 is not None:
         raw = up2.read()
@@ -288,50 +287,40 @@ with tab_data:
             except Exception as e:
                 parse_err = e
                 continue
-                
         if d_raw is None:
             st.error(f"CSV 파싱 에러 발생: {parse_err}")
         else:
             d_clean = pd.DataFrame(columns=st.session_state.df.columns)
             for col in st.session_state.df.columns:
-                if col in d_raw.columns:
-                    d_clean[col] = d_raw[col]
-                else:
-                    d_clean[col] = np.nan
+                d_clean[col] = d_raw[col] if col in d_raw.columns else np.nan
             
             ee_col = "encapsulation_efficiency_percent_std_num"
             d_clean[ee_col] = d_clean[ee_col].map(P.robust_ee)
             
             num_cols = ["np_ratio_std_num", "buffer_ph_std_num", "particle_size_nm_std_num", "pdi_std_num", "zeta_potential_mv_std_num"]
             for col in num_cols:
-                if col in d_clean.columns:
-                    d_clean[col] = pd.to_numeric(d_clean[col], errors='coerce')
+                if col in d_clean.columns: d_clean[col] = pd.to_numeric(d_clean[col], errors='coerce')
 
             st.write("---")
             st.subheader("가져온 데이터 미리보기 (자동 정제됨)")
             st.dataframe(d_clean.head(5))
             
             n_invalid = d_clean[ee_col].isna().sum()
-            if n_invalid > 0:
-                st.warning(f"⚠️ 경고: {n_invalid}개 행은 EE 수치가 없어서 추가에서 제외됩니다.")
+            if n_invalid > 0: st.warning(f"⚠️ 경고: {n_invalid}개 행은 EE 수치가 없어서 제외됩니다.")
                 
             c1, c2 = st.columns(2)
             if c1.button(f"정상 데이터 {len(d_clean) - n_invalid}행 추가하기"):
-                valid_d = d_clean.dropna(subset=[ee_col])
-                add_rows(valid_d)
+                add_rows(d_clean.dropna(subset=[ee_col]))
                 
-            if c2.button("기존 데이터를 이 파일로 교체"):
+            if c2.button(f"⚠️ 검열 우회: 이 {len(d_clean) - n_invalid}행으로 다이렉트 덮어쓰기", type="primary"):
                 valid_d = d_clean.dropna(subset=[ee_col])
                 if len(valid_d) == 0:
-                    st.error("추가할 수 있는 행이 없습니다(EE 수치 없음). 교체하지 않았습니다.")
-                elif len(valid_d) < len(st.session_state.df) * 0.5:
-                    st.warning(f"현재 {len(st.session_state.df)}행 → {len(valid_d)}행으로 절반 이하가 됩니다.")
-                    if st.checkbox("그래도 위험을 감수하고 교체합니다"):
-                        st.session_state.df = _empty()
-                        add_rows(valid_d)
+                    st.error("데이터를 읽지 못했습니다! CSV 파일의 EE 컬럼명을 확인해 주세요.")
                 else:
-                    st.session_state.df = _empty()
-                    add_rows(valid_d)
+                    st.session_state.df = valid_d.copy().reset_index(drop=True)
+                    save_disk()
+                    st.success(f"✅ {len(valid_d)}행으로 데이터베이스가 완벽하게 강제 덮어쓰기 되었습니다.")
+                    st.rerun()
 
     st.divider()
     st.subheader("📝 엑셀에서 바로 복사/붙여넣기")
@@ -339,50 +328,16 @@ with tab_data:
         st.info("아직 데이터가 없습니다.")
     else:
         ed = st.data_editor(st.session_state.df, num_rows="dynamic", use_container_width=True, key="main_edit", height=380)
-        
-        # 💡 [패치] 편집 내용 저장 시에도 행 축소 경고를 위한 안전 확인 프로세스 추가
-        b1, b2, b3 = st.columns(3)
-        if b1.button("편집 내용 적용 심사", type="primary"):
-            if "lipid_molar_ratio" in ed.columns:
-                valid_ed = ed.dropna(subset=["lipid_molar_ratio"])
-                valid_ed = valid_ed[valid_ed["lipid_molar_ratio"].astype(str).str.strip() != ""]
-            else:
-                valid_ed = ed
-            
+        if st.button("편집 내용 적용 심사", type="primary"):
+            valid_ed = ed.dropna(subset=["lipid_molar_ratio"]) if "lipid_molar_ratio" in ed.columns else ed
             res = GD.screen_new_rows(valid_ed, _empty(), reduce_fn=AH.reduce_to_four)
-            
-            st.session_state["temp_edited_res"] = res
+            st.session_state.df = res["accepted"]
+            save_disk()
+            st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
             st.rerun()
-            
-        if "temp_edited_res" in st.session_state:
-            res = st.session_state["temp_edited_res"]
-            
-            if len(res["rejected"]):
-                st.warning(f"{len(res['rejected'])}개의 불량 행이 감지되어 제거되었습니다.")
-            
-            if len(res["accepted"]) < len(st.session_state.df):
-                st.warning(f"⚠️ 원본 {len(st.session_state.df)}행에서 {len(res['accepted'])}행으로 크게 줄어듭니다! (중복 제거 등 원인)")
-                
-                if st.checkbox("이대로 덮어쓰기에 동의합니다."):
-                    if st.button("확정 및 저장"):
-                        st.session_state.df = res["accepted"]
-                        save_disk()
-                        del st.session_state["temp_edited_res"]
-                        st.success("✅ 편집 내용이 안전하게 덮어씌워졌습니다.")
-                        st.rerun()
-                else:
-                    if st.button("취소 및 초기화"):
-                        del st.session_state["temp_edited_res"]
-                        st.rerun()
-            else:
-                st.session_state.df = res["accepted"]
-                save_disk()
-                del st.session_state["temp_edited_res"]
-                st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
-                st.rerun()
 
 # ==========================================================================
-# 탭 4 — 모델 실행 및 앵커링 (💡 V5 cv_report 적용)
+# 탭 4 — 모델 실행 및 앵커링 (💡 V6 cv_report 적용)
 # ==========================================================================
 with tab_model:
     st.header("모델 실행")
@@ -394,9 +349,9 @@ with tab_model:
     if st.button("평가 실행", type="primary", disabled=(n_pap < 3)):
         from scipy.stats import spearmanr
         
-        with st.spinner("중첩 CV 진행 중... (변환 스케일 자동 선택)"):
-            # 💡 [V5 패치] 외부 폴드별로 V5AutoScaler를 적용해 낙관적 편향 방지
-            rep = M5.cv_report(work_df, v3)
+        with st.spinner("중첩 CV 진행 중... (변환 강도 자동 선택)"):
+            # 💡 [V6 패치] M6.cv_report 호출
+            rep = M6.cv_report(work_df, v3)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("모델 MAE", f"{rep['mae_model']:.2f} %p")
@@ -409,7 +364,7 @@ with tab_model:
         st.write(f"**논문 간 분산 비중(ICC) = {icc:.2f}**")
 
         groups = rep["groups"]
-        pm = rep["pred"]
+        pm = rep["pred"]  # 💡 V6 리포트 반환 키 ('pred')
         y = rep["y"]
         
         rhos = [spearmanr(y.loc[idx], pd.Series(pm, index=y.index).loc[idx])[0] 
@@ -431,7 +386,7 @@ with tab_model:
 with tab_opt:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        st.caption(base_model.transform_note)  # 💡 V5 변환 스케일 선택 결과 출력
+        st.caption(base_model.transform_note)  # 💡 V6 변환 스케일 선택 결과 출력
         TO.tab_optimize_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
@@ -439,7 +394,7 @@ with tab_opt:
 with tab_what:
     if len(work_df) > 10:
         base_model = cached_model(work_df)
-        st.caption(base_model.transform_note)  # 💡 V5 변환 스케일 선택 결과 출력
+        st.caption(base_model.transform_note)  # 💡 V6 변환 스케일 선택 결과 출력
         TO.tab_whatif_anchored(st, work_df, base_model, v3, O)
     else:
         st.warning("🚨 데이터가 너무 적습니다. '데이터 관리' 탭에서 데이터를 더 추가해주세요.")
