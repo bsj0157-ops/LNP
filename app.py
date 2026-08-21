@@ -50,6 +50,7 @@ import app_tabs_offset as TO
 import lnp_app_livenote as LN
 import lnp_features_lean as FL
 import lnp_uncertainty as U
+import lnp_model_v4 as M4
 
 try:
     import lnp_pdf as LP
@@ -112,8 +113,8 @@ cached = C.install(st, F2, v3, P)
 work_df, work_info = cached["working_df"](st.session_state.df)
 oof = cached["oof"](work_df)
 
-# 💡 [패치] 불필요한 SMILES 기술자를 빼서 정확도와 속도를 높인 Lean Model로 교체
-cached_model = FL.make_cached_lean_model(st, v3)
+# 💡 [패치] Logit 타깃 + RF/ExtraTrees 앙상블이 적용된 V4 모델로 교체
+cached_model = M4.make_cached_v4_model(st, v3)
 
 # --------------------------------------------------------------------------
 # 사이드바 — 현황
