@@ -392,32 +392,20 @@ with tab_model:
         st.warning(f"논문이 {n_pap}편입니다. 논문 단위 5-fold CV에는 최소 5편 이상이 필요합니다.")
 
     if st.button("평가 실행", type="primary", disabled=(n_pap < 3)):
-        from sklearn.compose import ColumnTransformer
         from sklearn.dummy import DummyRegressor
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.impute import SimpleImputer
         from sklearn.metrics import mean_absolute_error
         from sklearn.model_selection import GroupKFold, cross_val_predict
-        from sklearn.pipeline import Pipeline
-        from sklearn.preprocessing import OneHotEncoder, StandardScaler
         from scipy.stats import spearmanr
 
-        # 💡 [패치] 반복 계산 병목 제거: cached matrix 사용
-        X, y, groups, num_cols, cat_cols = cached["matrix"](work_df)
-
-        pre = ColumnTransformer([
-            ("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols),
-            ("c", Pipeline([("i", SimpleImputer(strategy="most_frequent")),
-                            ("o", OneHotEncoder(handle_unknown="ignore", min_frequency=2))]), cat_cols)]
-            if cat_cols else
-            [("n", Pipeline([("i", SimpleImputer(strategy="median")), ("s", StandardScaler())]), num_cols)])
-        
-        model = Pipeline([("pre", pre),
-                          ("m", RandomForestRegressor(n_estimators=400, min_samples_leaf=3, max_features=0.5, random_state=42, n_jobs=-1))])
+        # 💡 [V4 모델 패치] 이전의 무거운 파이프라인을 걷어내고 V4(Logit + 앙상블)로 교체
+        X, y, groups, num_cols, cat_cols = FL.build_lean_matrix(work_df, v3)
+        model = M4.LogitEnsemble(num_cols=list(num_cols), cat_cols=list(cat_cols))
 
         k = min(5, groups.nunique())
         cv = GroupKFold(n_splits=k)
-        with st.spinner("교차검증 중..."):
+        
+        with st.spinner("V4 모델 기반 교차검증 중..."):
+            # M4 모델의 predict 함수는 내부적으로 Logit 변환과 역변환을 수행합니다.
             pm = cross_val_predict(model, X, y, cv=cv, groups=groups)
             pb = cross_val_predict(DummyRegressor(strategy="mean"), X, y, cv=cv, groups=groups)
 
