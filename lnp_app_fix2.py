@@ -69,7 +69,7 @@ Atlas 628행 + web 680행 = 1308행으로 배포 앱과 같은 조건에서 측�
         v3.build_features(25) MAE 16.43 %p   baseline 대비 +7.6%
         baseline (평균)       MAE 17.78 %p
 
-    사용자가 탭4에서 본 숫자로 탭5·6의 결과를 해석하게 됩니다.
+    사용자는 탭4에서 본 숫자로 탭5·6의 결과를 해석하게 됩니다.
     게다가 열등한 특징집합의 성능을 보고 있습니다.
 
     -> 해결: 탭4도 v3.build_features 를 쓰십시오 (build_eval_matrix 참고).
@@ -181,7 +181,8 @@ def df_fingerprint(df):
     cols = [c for c in (DOI_COL, RATIO_COL, EE_COL) if c in df.columns]
     if not cols:
         return "?"
-    s = df[cols].astype(str).agg("|".join, axis=1).str.cat(sep="\n")
+    # 💡 [패치] Pandas 3.0 NaN 문자열 결합 충돌을 막기 위한 fillna("") 적용
+    s = df[cols].fillna("").astype(str).agg("|".join, axis=1).str.cat(sep="\n")
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
 
 
@@ -493,7 +494,7 @@ def anchored_full_table(work_df, v3_module, anchor_module, anchor_idx, anchor_y,
         "오차 (%p)": (np.asarray(adj) - y.values).round(1),
     })
     tab.insert(0, "앵커", ["⚓" if i in set(a_pos if a_pairs else []) else ""
-                          for i in range(len(tab))])
+                           for i in range(len(tab))])
     tab.insert(1, "앵커 논문", np.where(same.values, "✓", ""))
 
     # 예측 신뢰도 — 실측 구간별 오차가 크게 다릅니다(554행 CV 측정).
