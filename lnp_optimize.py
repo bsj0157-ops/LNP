@@ -71,7 +71,7 @@ COMP_KR = {"ionizable": "이온화지질", "helper": "헬퍼지질",
            "chol": "콜레스테롤", "peg": "PEG지질"}
 
 # 트리 분산이 실제 오차의 48% 만 반영 → 보정 계수 (실측 16.44/7.89)
-UNCERTAINTY_SCALE = 2.08
+UNCERTAINTY_SCALE = 1.95
 
 # 신호/잡음비가 2.0 을 넘은 성분만 '최적화 근거 있음'으로 표시합니다 (위 3번)
 TRUSTED_COMPONENTS = ["peg"]
@@ -332,6 +332,15 @@ def predict_with_uncertainty(model, X):
     """
     pred = np.asarray(model.predict(X), float)
     sd = None
+    # v7 래퍼처럼 산포를 직접 주는 모델이면 그것을 씁니다. 점추정이 HistGB 인
+    # 모델은 named_steps 로 트리를 꺼낼 수 없어 아래 경로가 상수로 떨어집니다.
+    if hasattr(model, "predict_sd"):
+        try:
+            s = np.asarray(model.predict_sd(X), float)
+            if np.isfinite(s).any():
+                return pred, s * UNCERTAINTY_SCALE
+        except Exception:
+            pass
     try:
         steps = getattr(model, "named_steps", None)
         if steps:
@@ -345,7 +354,7 @@ def predict_with_uncertainty(model, X):
     except Exception:
         sd = None
     if sd is None:
-        sd = np.full(len(pred), 16.4)     # 실측 CV MAE
+        sd = np.full(len(pred), 13.1)     # 실측 CV MAE (v7, 1107행/374논문)
     return pred, sd
 
 
