@@ -25,8 +25,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-warnings.filterwarnings("ignore")
-
 RANDOM_STATE = 42
 TARGET = "encapsulation_efficiency_percent_std_num"
 CSV_HINT = "LNP_Atlas_DB_202509_v1.CSV"   # 경로를 알면 여기에 직접 적어도 됩니다
@@ -97,9 +95,6 @@ def parse_lipid_ratio(series):
 
 def smiles_features(series):
     """이온화 지질 SMILES → 물리화학 descriptor. len(SMILES)는 쓰지 않음."""
-    # pandas 3.0 부터 astype(str) 이 NaN 을 'nan' 문자열로 바꾸지 않고
-    # float NaN 으로 보존합니다. 그대로 두면 RDKit 에 float 이 들어가
-    # TypeError 가 납니다(실측). fillna 를 먼저 걸어 통일합니다.
     smi = series.fillna("").astype(object).map(
         lambda v: "" if v is None or (isinstance(v, float) and np.isnan(v))
         else str(v).strip())
@@ -363,7 +358,7 @@ def sanity_check():
     m1, b1 = grouped_mae(y_sig)
     gain1 = (1 - m1 / b1) * 100
     passA = gain1 > 20
-    print(f"  (A) 신호 있는 데이터   model MAE={m1:.2f}  baseline={b1:.2f}  "
+    print(f"  (A) 신호 있는 데이터    model MAE={m1:.2f}  baseline={b1:.2f}  "
           f"개선={gain1:+.1f}%")
     print((_ok if passA else _fail) + "신호가 있을 때 모델이 baseline을 이긴다"
           + ("" if passA else "  ← 평가 코드가 신호를 놓치고 있음"))
@@ -372,7 +367,7 @@ def sanity_check():
     m2, b2 = grouped_mae(y_null)
     gain2 = (1 - m2 / b2) * 100
     passB = gain2 < 5
-    print(f"  (B) y를 섞은 데이터    model MAE={m2:.2f}  baseline={b2:.2f}  "
+    print(f"  (B) y를 섞은 데이터     model MAE={m2:.2f}  baseline={b2:.2f}  "
           f"개선={gain2:+.1f}%")
     print((_ok if passB else _fail) + "신호가 없을 때 baseline을 못 이긴다"
           + ("" if passB else "  ← leakage 있음!"))
@@ -581,7 +576,7 @@ def significance_test(y, preds, groups):
     stat, p = wilcoxon(per[:, 0], per[:, 1])
     n_better = int((per[:, 0] < per[:, 1]).sum())
     print(f"\n  Wilcoxon 검정 ({best} vs baseline, 논문 {len(per)}편 짝지음)")
-    print(f"    모델이 더 정확한 논문: {n_better}/{len(per)}편   p = {p:.4f}")
+    print(f"    모델이 더 정확한 논문: {n_better}/{len(per)}편    p = {p:.4f}")
     return best, p, len(per)
 
 
@@ -689,6 +684,10 @@ def make_figure(res, preds, y, key, fname="lnp_v3_report.png"):
 # ==========================================================================
 
 def run_all():
+    # 💡 [패치] 이 모듈이 import 될 때 Streamlit 앱 전체의 경고가 무시되는 것을 막기 위해
+    # 경고 무시(warnings.filterwarnings) 로직을 전역에서 함수 내부로 이동했습니다.
+    warnings.filterwarnings("ignore")
+    
     print("LNP-Predictor v3  자체 검증 실행")
     print(f"python {sys.version.split()[0]} | pandas {pd.__version__} | "
           f"numpy {np.__version__}")
@@ -744,7 +743,6 @@ def run_all():
     return res
 
 
+# 💡 [패치] 모듈 임포트 시 무거운 CV 로직이 실행되어 앱이 지연되는 것을 막는 메인 가드
 if __name__ == "__main__":
     results = run_all()
-
-# results = run_all()
