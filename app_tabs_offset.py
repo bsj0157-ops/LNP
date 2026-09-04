@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 import lnp_offset_bus as OB
-import lnp_model_v6 as M6  # 💡 [에러 해결] V5 -> V6 모델 임포트로 완벽히 교체!
+import lnp_model_v7 as M7  # 💡 [에러 해결] V6 -> 최신 V7 모델 임포트로 완벽히 교체!
 
 
 def tab_optimize_anchored(st, df, model, v3_module, O):
@@ -84,13 +84,15 @@ def tab_optimize_anchored(st, df, model, v3_module, O):
             f"최적화에서 단순 덧셈은 상위 후보를 모두 100%로 만들어 구별할 수 "
             f"없게 만듭니다.")
 
-    # 💡 [V6 패치] M6.band_of 함수로 연결
-    T["신뢰도"] = T["pred_sd"].apply(M6.band_of)
-    
-    # 만약 '매우 낮음' 처방이 섞여 있다면 사용자에게 직접 경고
-    n_untrusted = (T["신뢰도"] == "매우 낮음").sum()
-    if n_untrusted > 0:
-        st.error(f"🚨 주의: 상위 후보 중 {n_untrusted}개는 예측 신뢰도가 '매우 낮음'입니다. 표에서 신뢰도를 확인하시고 해당 레시피는 피하십시오.")
+    # 💡 [V7 패치] M7.band_of 함수로 연결
+    if hasattr(M7, "band_of"):
+        T["신뢰도"] = T["pred_sd"].apply(M7.band_of)
+        n_untrusted = (T["신뢰도"] == "매우 낮음").sum()
+        if n_untrusted > 0:
+            st.error(f"🚨 주의: 상위 후보 중 {n_untrusted}개는 예측 신뢰도가 '매우 낮음'입니다. 표에서 신뢰도를 확인하시고 해당 레시피는 피하십시오.")
+        cols_extra = ["±불확실성", "신뢰도", "기준 대비", "순위 해석"]
+    else:
+        cols_extra = ["±불확실성", "기준 대비", "순위 해석"]
 
     show = T.rename(columns={
         "ionizable": "이온화(%)", "helper": "헬퍼(%)", "chol": "콜레스테롤(%)",
@@ -101,7 +103,7 @@ def tab_optimize_anchored(st, df, model, v3_module, O):
     cols = ["이온화(%)", "헬퍼(%)", "콜레스테롤(%)", "PEG(%)", "예측 EE(%)"]
     if off:
         cols.append("보정 전")
-    cols += ["±불확실성", "신뢰도", "기준 대비", "순위 해석"]  # 신뢰도 열 추가
+    cols += cols_extra
     st.dataframe(show[cols], hide_index=True)
 
     st.info(
@@ -160,13 +162,16 @@ def tab_whatif_anchored(st, df, model, v3_module, O):
 
     st.markdown(f"- 조성: `{r['ratio_before']}` → `{r['ratio_after']}`")
     
-    # 💡 [V6 패치] M6.band_of 사용
-    trust_label = M6.band_of(r['delta_sd'])
-    st.markdown(f"- 영점 없는 예측 변화량 **{r['delta']:+.1f} %p**, "
-                f"불확실성 ±{r['delta_sd']:.1f} %p (신뢰도: **{trust_label}**)")
-                
-    if trust_label == "매우 낮음":
-        st.error(f"🚨 **낯선 처방입니다!** 트리 간 예측 편차가 너무 커 예측 신뢰도가 매우 낮습니다. 실험 결과가 전혀 다를 수 있으니 가급적 피하십시오.")
+    # 💡 [V7 패치] M7.band_of 사용
+    if hasattr(M7, "band_of"):
+        trust_label = M7.band_of(r['delta_sd'])
+        st.markdown(f"- 영점 없는 예측 변화량 **{r['delta']:+.1f} %p**, "
+                    f"불확실성 ±{r['delta_sd']:.1f} %p (신뢰도: **{trust_label}**)")
+        if trust_label == "매우 낮음":
+            st.error(f"🚨 **낯선 처방입니다!** 모델 간 예측 편차가 너무 커 예측 신뢰도가 매우 낮습니다. 실험 결과가 전혀 다를 수 있으니 가급적 피하십시오.")
+    else:
+        st.markdown(f"- 영점 없는 예측 변화량 **{r['delta']:+.1f} %p**, "
+                    f"불확실성 ±{r['delta_sd']:.1f} %p")
 
     if off:
         st.caption(
