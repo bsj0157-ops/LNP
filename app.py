@@ -18,21 +18,15 @@
 
 import io
 import os
-import sys
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-import lnp_harvest
-import lnp_pdf
 import lnp_entry as LE
 import lnp_predictor_v3_patched as v3
-import lnp_anchor
 import lnp_app_patch as P
 import lnp_optimize as O
-from app_tabs_optimize import tab_optimize, tab_whatif
-import lnp_peg as PG
 import app_tab_peg as TP
 
 # 💡 새로운 모듈 통합
@@ -42,26 +36,34 @@ import lnp_autoharvest as AH
 import app_tab_harvest as TH
 import lnp_app_cache as C
 import lnp_app_guard as GD
-import lnp_anchor2 as A2
 import app_tab_anchor2 as T2
 import app_tabs_offset as TO
 
 # 💡 실시간 정확도 노트 및 가벼운 모델, 불확실성 모듈 임포트
 import lnp_app_livenote as LN
-import lnp_features_lean as FL
-import lnp_uncertainty as U
-import lnp_model_v6 as M6  # 💡 [패치] V6 자동 스케일 모델 임포트
+import lnp_model_v7 as M7          # v6 -> v7 (원 스케일 HistGB, clipping 없음)
 
+# lnp_pdf 는 여기서만 임포트합니다. 위에서 무조건 임포트하면 pdfplumber 가 없을 때
+# 이 try 에 닿기 전에 앱 전체가 죽어서 PDF_OK 안내가 뜨지 않습니다.
 try:
     import lnp_pdf as LP
-    PDF_OK = True
+    PDF_OK, PDF_ERR = True, ""
 except Exception as _e:
-    PDF_OK = False
-    PDF_ERR = str(_e)
+    PDF_OK, PDF_ERR = False, str(_e)
 
 st.set_page_config(page_title="LNP Data Studio", page_icon="🧪", layout="wide")
 
 DATA_FILE = "lnp_web_data.csv"
+
+# 데이터가 바뀌어도 변하지 않는 해석 주의사항만 남깁니다.
+# 수치(MAE·ICC·적중률)는 F2.ACCURACY_NOTE 에 박아 두지 말고 아래 버튼으로 실측합니다.
+ACCURACY_CAVEATS = """**읽는 법**
+
+- 앵커링 탭이 띄우는 MAE 는 **학습에 쓴 행을 다시 예측한 값**입니다. 새 논문 정확도가 아닙니다.
+- EE 변동의 상당 부분이 조성이 아니라 '어느 논문인지'에서 옵니다(ICC 는 아래에서 실측).
+- 앵커링 효과는 논문에 따라 갈립니다. 원래 크게 틀리는 논문에서만 이득이 관찰됐습니다.
+- 비율만 바꾼 what-if 방향 판단은 무작위 수준이었습니다. 순위·방향 결정에 쓰지 마십시오.
+"""
 
 # --------------------------------------------------------------------------
 # 상태 및 데이터 저장 (Google Sheets 연동 지원)
@@ -87,8 +89,25 @@ if "df" not in st.session_state:
 
     st.session_state.df = loaded if loaded is not None else _empty()
 
-def save_disk():
-    store.save(st.session_state.df)
+BACKUP_FILE = "lnp_web_data_backup.csv"
+
+def save_disk(backup: bool = False):
+    """저장 실패를 삼키지 않습니다. 실패하면 메모리에만 남았다고 알립니다."""
+    if backup:
+        try:
+            prev = store.load()
+            if prev is not None and len(prev):
+                prev.to_csv(BACKUP_FILE, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            st.warning(f"백업 실패 — 교체를 중단하는 편이 안전합니다: {e}")
+            return False
+    try:
+        store.save(st.session_state.df)
+        return True
+    except Exception as e:
+        st.error(f"저장 실패 ({store.describe()}): {e}\n"
+                 "화면의 데이터는 이 세션에만 있습니다. 사이드바에서 내려받아 두십시오.")
+        return False
 
 def add_rows(new_rows: pd.DataFrame):
     res = GD.screen_new_rows(new_rows, st.session_state.df, reduce_fn=AH.reduce_to_four)
@@ -102,8 +121,8 @@ def add_rows(new_rows: pd.DataFrame):
         
     if not res["accepted"].empty:
         st.session_state.df = pd.concat([st.session_state.df, res["accepted"]], ignore_index=True)
-        save_disk()
-        st.success(f"{len(res['accepted'])}행 추가 및 저장 완료.")
+        if save_disk():
+            st.success(f"{len(res['accepted'])}행 추가 및 저장 완료.")
         st.rerun()
 
 # --------------------------------------------------------------------------
@@ -111,9 +130,16 @@ def add_rows(new_rows: pd.DataFrame):
 # --------------------------------------------------------------------------
 cached = C.install(st, F2, v3, P)
 work_df, work_info = cached["working_df"](st.session_state.df)
-oof = cached["oof"](work_df)
 
-cached_model = M6.make_cached_v6_model(st, v3)
+def get_oof():
+    """논문 단위 CV 예측. 첫 계산에 수십 초 걸리므로 **쓰는 곳에서만** 부릅니다.
+
+    이전 판은 모듈 스코프에서 계산해, PDF 탭만 쓰려고 접속한 사람도
+    데이터가 바뀔 때마다 전체 CV 를 기다려야 했습니다.
+    """
+    return cached["oof"](work_df)
+
+cached_model = M7.make_cached_v7_model(st, v3)
 
 # --------------------------------------------------------------------------
 # 사이드바 — 현황
@@ -142,7 +168,13 @@ st.sidebar.caption(
     "서로 닮아 있습니다. 무작위로 나누면 성능이 부풀려지므로 논문 단위로 "
     "나눠야 하고, 그때 실질 표본 수는 행 수가 아니라 논문 수입니다.")
 
-st.sidebar.markdown(LN.accuracy_note(work_df, oof, base_note=F2.ACCURACY_NOTE))
+with st.sidebar.expander("예측 정확도 (실측)"):
+    st.markdown(ACCURACY_CAVEATS)
+    if st.button("현재 데이터로 계산", key="acc_note"):
+        st.markdown(LN.accuracy_note(work_df, get_oof(), base_note=""))
+    else:
+        st.caption("숫자는 논문 단위 CV 를 돌려야 나옵니다(수십 초). "
+                   "F2.ACCURACY_NOTE 의 고정 수치는 옛 데이터·옛 모델 값이라 뺐습니다.")
 
 if len(st.session_state.df):
     st.sidebar.divider()
@@ -279,17 +311,28 @@ with tab_data:
     
     if up2 is not None:
         raw = up2.read()
-        d_raw = None
-        for enc in ("utf-8-sig", "cp949", "latin-1"):
+        d_raw, parse_err = None, None
+        # latin-1 은 어떤 바이트든 통과시키므로 후보에서 뺐습니다. 그대로 두면
+        # cp949/utf-16 파일이 '성공'으로 읽히고 DOI 가 깨진 채 저장됩니다.
+        # DOI 는 논문 단위 CV 의 그룹 키라서, 깨지면 같은 논문이 여러 논문으로 갈립니다.
+        for enc in ("utf-8-sig", "utf-8", "cp949", "utf-16"):
             try:
-                d_raw = pd.read_csv(io.BytesIO(raw), encoding=enc)
-                break
+                cand = pd.read_csv(io.BytesIO(raw), encoding=enc)
             except Exception as e:
                 parse_err = e
                 continue
-                
+            if "reference_doi" in cand.columns:
+                s = cand["reference_doi"].astype(str)
+                # DOI 는 ASCII 입니다. 비ASCII 가 섞였으면 인코딩을 잘못 잡은 것입니다.
+                if s.str.contains(r"[^\x00-\x7f]").mean() > 0.05:
+                    parse_err = f"{enc} 로 읽었으나 DOI 에 깨진 문자가 섞였습니다"
+                    continue
+            d_raw = cand
+            break
+
         if d_raw is None:
-            st.error(f"CSV 파싱 에러 발생: {parse_err}")
+            st.error(f"CSV 를 읽지 못했습니다: {parse_err}\n"
+                     "엑셀이면 '다른 이름으로 저장 > CSV UTF-8' 로 저장해 주세요.")
         else:
             # 💡 [핵심 패치] 양식 엄격 검사 로직
             expected_cols = list(st.session_state.df.columns)
@@ -324,16 +367,25 @@ with tab_data:
                 if c1.button(f"정상 데이터 {len(d_clean) - n_invalid}행 추가하기"):
                     add_rows(d_clean.dropna(subset=[ee_col]))
                     
-                # 안전하고 정직한 덮어쓰기 버튼으로 변경
-                if c2.button(f"🔄 기존 데이터를 이 {len(d_clean) - n_invalid}행으로 안전하게 교체", type="primary"):
-                    valid_d = d_clean.dropna(subset=[ee_col])
+                # 교체는 되돌릴 수 없습니다 — 백업과 확인 입력을 요구합니다.
+                valid_d = d_clean.dropna(subset=[ee_col])
+                cur_n = len(st.session_state.df)
+                c2.caption(f"교체하면 현재 {cur_n}행이 {len(valid_d)}행으로 **바뀝니다**. "
+                           f"{max(0, cur_n - len(valid_d))}행이 사라질 수 있습니다.")
+                confirm = c2.text_input("교체를 원하면 REPLACE 를 입력하세요", key="confirm_replace")
+                if c2.button(f"🔄 {len(valid_d)}행으로 교체", type="primary",
+                             disabled=(confirm.strip().upper() != "REPLACE")):
                     if len(valid_d) == 0:
                         st.error("유효한 데이터(EE 수치 포함)가 없어 교체할 수 없습니다.")
                     else:
+                        prev = st.session_state.df.copy()
                         st.session_state.df = valid_d.copy().reset_index(drop=True)
-                        save_disk()
-                        st.success(f"✅ {len(valid_d)}행으로 데이터베이스가 안전하게 교체되었습니다.")
-                        st.rerun()
+                        if save_disk(backup=True):
+                            st.success(f"✅ {len(valid_d)}행으로 교체했습니다. "
+                                       f"이전 데이터는 {BACKUP_FILE} 에 남겼습니다.")
+                            st.rerun()
+                        else:
+                            st.session_state.df = prev      # 저장 실패 시 되돌립니다
 
     st.divider()
     st.subheader("📝 엑셀에서 바로 복사/붙여넣기")
@@ -341,13 +393,46 @@ with tab_data:
         st.info("아직 데이터가 없습니다.")
     else:
         ed = st.data_editor(st.session_state.df, num_rows="dynamic", use_container_width=True, key="main_edit", height=380)
-        if st.button("편집 내용 적용 심사", type="primary"):
-            valid_ed = ed.dropna(subset=["lipid_molar_ratio"]) if "lipid_molar_ratio" in ed.columns else ed
-            res = GD.screen_new_rows(valid_ed, _empty(), reduce_fn=AH.reduce_to_four)
-            st.session_state.df = res["accepted"]
-            save_disk()
-            st.success("✅ 편집 내용이 성공적으로 저장되었습니다.")
-            st.rerun()
+        # 이 버튼은 DB 전체를 심사 통과 행으로 **교체**합니다. 이전 판은 기각 행과
+        # 몰비가 빈 행을 말없이 버리고 저장까지 해서, 표에서 셀 하나만 고쳐도
+        # 심사에 걸린 행이 영구히 사라졌습니다. 무엇이 빠지는지 먼저 보여줍니다.
+        if st.button("편집 내용 심사 (아직 저장 안 함)", key="screen_edit"):
+            has_ratio = (ed["lipid_molar_ratio"].notna() if "lipid_molar_ratio" in ed.columns
+                         else pd.Series(True, index=ed.index))
+            st.session_state["edit_screen"] = {
+                "res": GD.screen_new_rows(ed[has_ratio], _empty(), reduce_fn=AH.reduce_to_four),
+                "n_no_ratio": int((~has_ratio).sum()),
+                "n_in": len(ed),
+            }
+
+        scr = st.session_state.get("edit_screen")
+        if scr:
+            res, acc = scr["res"], scr["res"]["accepted"]
+            n_drop = scr["n_in"] - len(acc)
+            for m in res["messages"]:
+                st.info(m)
+            if scr["n_no_ratio"]:
+                st.warning(f"몰비가 빈 {scr['n_no_ratio']}행은 심사 대상에서 빠집니다.")
+            if len(res["rejected"]):
+                st.error(f"기각 {len(res['rejected'])}행 — 저장하면 사라집니다.")
+                st.dataframe(res["rejected"][["why"] + [c for c in ed.columns
+                                                        if c in res["rejected"].columns]])
+            st.caption(f"편집 {scr['n_in']}행 -> 통과 {len(acc)}행 (**{n_drop}행 감소**)")
+            k1, k2 = st.columns(2)
+            confirm_e = k1.text_input("저장하려면 SAVE 를 입력하세요", key="confirm_edit")
+            if k1.button(f"통과 {len(acc)}행으로 저장", type="primary",
+                         disabled=(confirm_e.strip().upper() != "SAVE" or acc.empty)):
+                prev = st.session_state.df.copy()
+                st.session_state.df = acc.reset_index(drop=True)
+                if save_disk(backup=True):
+                    st.session_state.pop("edit_screen", None)
+                    st.success(f"✅ {len(acc)}행 저장. 이전 데이터는 {BACKUP_FILE} 에 있습니다.")
+                    st.rerun()
+                else:
+                    st.session_state.df = prev
+            if k2.button("취소", key="cancel_edit"):
+                st.session_state.pop("edit_screen", None)
+                st.rerun()
 
 # ==========================================================================
 # 탭 4 — 모델 실행 및 앵커링 
@@ -362,15 +447,18 @@ with tab_model:
     if st.button("평가 실행", type="primary", disabled=(n_pap < 3)):
         from scipy.stats import spearmanr
         
-        with st.spinner("중첩 CV 진행 중... (변환 강도 자동 선택)"):
-            rep = M6.cv_report(work_df, v3)
+        with st.spinner("논문 단위 CV 진행 중…"):
+            rep = M7.cv_report(work_df, v3)
 
         c1, c2, c3 = st.columns(3)
         c1.metric("모델 MAE", f"{rep['mae_model']:.2f} %p")
         c2.metric("baseline MAE", f"{rep['mae_baseline']:.2f} %p")
         c3.metric("개선율", f"{rep['gain_pct']:+.1f} %", delta=f"{'유의미' if rep['gain_pct'] > 5 else '미미'}")
 
-        st.caption("💡 폴드별 변환 선택: " + " · ".join(rep["picks"]))
+        st.caption("💡 " + rep["picks"][0] + " — v7 은 타깃 변환·clipping 이 없어 "
+                   "EE 90 % 이상도 예측할 수 있습니다(v6 은 구조적으로 불가).")
+        st.caption(f"트리 산포 -> 오차 환산 계수 실측 {rep['scale_hat']:.2f} "
+                   f"(lnp_optimize.UNCERTAINTY_SCALE 를 이 값으로 맞추십시오)")
 
         icc = F2.icc1(work_df)
         st.write(f"**논문 간 분산 비중(ICC) = {icc:.2f}**")
@@ -390,7 +478,10 @@ with tab_model:
         st.scatter_chart(res, x="실측 EE", y="예측 EE")
 
     st.divider()
-    T2.render(st, work_df, v3, F2, oof_series=oof)
+    # 앵커링 패널은 논문 단위 CV 예측(oof)이 필요합니다. 페이지를 열 때마다
+    # 자동으로 돌지 않게 사용자가 열 때만 계산합니다.
+    if st.checkbox("앵커링 패널 열기 (논문 단위 CV 계산, 수십 초)", key="open_anchor"):
+        T2.render(st, work_df, v3, F2, oof_series=get_oof())
 
 # ==========================================================================
 # 탭 5, 6, 7 — 영점 전파를 위한 감싸개(Wrapper) 적용
